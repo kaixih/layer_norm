@@ -3,7 +3,7 @@ This repo demonstrate how the forward and backward layer norm work. The
 reference is LayerNormalization layer from Keras.
 
 ## Layer Normalization Forward Pass
-Suppose $N, D$ are batch and feature dimensions respectively.
+Suppose <img src="https://render.githubusercontent.com/render/math?math=N, D"> are batch and feature dimensions respectively.
 
 <img src="https://render.githubusercontent.com/render/math?math=x: (N, D)">
 
