@@ -1,6 +1,7 @@
 # Layer Normalization Backprop
 ## Layer Normalization Forward Pass
-Suppose $N, D$ are batch and feature dimensions respectively. 
+Suppose $N, D$ are batch and feature dimensions respectively.
+<img src="https://render.githubusercontent.com/render/math?math=x: (N, D)"> 
 $$x: (N, D)$$
 $$\mu, \sigma ^2: (N, 1)$$
 $$\gamma, \beta: (1, D)$$
