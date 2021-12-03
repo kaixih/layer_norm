@@ -79,6 +79,9 @@ def backward(dy, cache, feature_axis):
   xmu = cache["xmu"]
   g = cache["gamma"]
 
+  dgamma = np.sum(dy * xmu / xivar, axis=batch_axis)
+  dbeta = np.sum(dy, axis=batch_axis)
+
   dl_di = dy * g / xivar
   di_dx = 1.
 
