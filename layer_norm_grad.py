@@ -5,7 +5,7 @@ epsilon = 0.001
 
 input_shape = (3, 2, 4)
 feature_axis = (1, 2)
-human_readable = False
+human_readable = True
 
 # Data preparation
 ndims = len(input_shape)
@@ -13,10 +13,11 @@ nelems = np.prod(input_shape)
 feature_shape=[]
 for axis in feature_axis:
   feature_shape.append(input_shape[axis])
+nfeatures = np.prod(feature_shape)
 if human_readable:
-  data = tf.cast(tf.reshape(tf.range(nelems), shape=input_shape), dtype=tf.float32)
-  gamma = tf.ones(shape=feature_shape)
-  beta = tf.zeros(shape=feature_shape)
+  data = tf.cast(tf.reshape(tf.range(nelems), shape=input_shape), dtype=tf.float32) / 10.
+  gamma = tf.cast(tf.reshape(tf.range(nfeatures), shape=feature_shape), dtype=tf.float32) / 10.
+  beta = tf.cast(tf.reshape(tf.range(nfeatures), shape=feature_shape), dtype=tf.float32) / 10.
 else:
   data = tf.random.normal(shape=input_shape)
   gamma = tf.random.normal(shape=feature_shape)
