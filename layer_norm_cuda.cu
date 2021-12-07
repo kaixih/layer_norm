@@ -14,8 +14,62 @@
 const int kBlockSize = 256;
 const int kThreadElements = 4;
 
+template<typename T>
+void Print2D(const T* x, int N, int D, std::string msg) {
+  printf("%s\n", msg.c_str());
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < D; j++) {
+      printf("%f, ", static_cast<float>(x[j + i * D]));
+    }
+    printf("\n");
+  }
+}
+
+template<typename T>
+void Print1D(const T* x, int N, std::string msg) {
+  printf("%s\n", msg.c_str());
+  for (int i = 0; i < N; i++) {
+    printf("%f, ", static_cast<float>(x[i]));
+  }
+  printf("\n");
+}
+
+template<typename T>
+void IsClose2D(const T* x, const T* y, int N, int D, std::string msg) {
+  bool is_same = true;
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < D; j++) {
+      float d_val = static_cast<float>(x[j + i * D]);
+      float h_val = static_cast<float>(y[j + i * D]);
+      if (abs(d_val - h_val > 0.03f)) {
+        is_same = false;
+        printf("Found diff: CPU=%f, GPU=%f at (%d, %d)\n", h_val, d_val, i, j);
+        break;
+      }
+    }
+    if (!is_same) break;
+  }
+  printf("Test (%s): %s\n", msg.c_str(), is_same ? "True" : "False");
+}
+
+template<typename T>
+void IsClose1D(const T* x, const T* y, int N, std::string msg) {
+  bool is_same = true;
+  for (int i = 0; i < N; i++) {
+    float d_val = static_cast<float>(x[i]);
+    float h_val = static_cast<float>(y[i]);
+    if (abs(d_val - h_val > 0.03f)) {
+      is_same = false;
+      printf("Found diff: CPU=%f, GPU=%f at (%d,)\n", h_val, d_val, i);
+      break;
+    }
+    if (!is_same) break;
+  }
+  printf("Test (%s): %s\n", msg.c_str(), is_same ? "True" : "False");
+}
+
 template<typename T, typename U>
-__host__ __device__ U GetData(const T* __restrict__ in, int offset) {
+__host__ __device__ U GetAs(const T* __restrict__ in, int offset) {
   return static_cast<U>(in[offset]);
 }
 
@@ -24,12 +78,12 @@ __device__ void GetStats(const T* __restrict__ row, const U epsilon,
                          U &mean, U &ivar, int tid, int D) {
   U sum = 0;
   for (int i = 0; i < D; i++) {
-    sum += GetData<T, U>(row, i);
+    sum += GetAs<T, U>(row, i);
   }
   mean = sum / D;
   U sum_ivar = 0;
   for (int i = 0; i < D; i++) {
-    U curr = GetData<T, U>(row, i);
+    U curr = GetAs<T, U>(row, i);
     sum_ivar += (curr - mean) * (curr - mean);
   }
   ivar = rsqrt(sum_ivar / D + epsilon);
@@ -52,7 +106,7 @@ __device__ void GetStatsV2(const T* __restrict__ row, const U epsilon,
   for (int round = 0; round < rounds; round++) {
     for (int j = 0; j < kThreadElements; j++) {
       if (i * kThreadElements + j < D) {
-        thread_data[j] = GetData<T, U>(row, i * kThreadElements + j);
+        thread_data[j] = GetAs<T, U>(row, i * kThreadElements + j);
       } else {
         thread_data[j] = static_cast<U>(0);
       }
@@ -74,7 +128,7 @@ __device__ void GetStatsV2(const T* __restrict__ row, const U epsilon,
   for (int round = 0; round < rounds; round++) {
     for (int j = 0; j < kThreadElements; j++) {
       if (i * kThreadElements + j < D) {
-        U curr = GetData<T, U>(row, i * kThreadElements + j);
+        U curr = GetAs<T, U>(row, i * kThreadElements + j);
         thread_data[j] = (curr - mean) * (curr - mean);
       } else {
         thread_data[j] = static_cast<U>(0);
@@ -111,7 +165,7 @@ __global__ void LayerNormKernel(const T* __restrict__ x,
     // GetStats(x + j * D, epsilon, mean, ivar, tid, D);
     GetStatsV2(x + j * D, epsilon, mean, ivar, tid, D);
     for (int i = tid; i < D; i += row_stride) {
-      U curr = GetData<T, U>(x, j * D + i);
+      U curr = GetAs<T, U>(x, j * D + i);
       y[j * D + i] =
           static_cast<T>((curr - mean) * ivar * gamma[i] + beta[i]);
       // Intermediate results to speedup backprop.
@@ -128,19 +182,19 @@ void LayerNormCPU(const T* x, const U* gamma, const U* beta, const U epsilon,
     U mean, ivar;
     U sum = 0;
     for(int i = 0; i < D; i++) {
-      U curr = GetData<T, U>(x, j * D + i);
+      U curr = GetAs<T, U>(x, j * D + i);
       sum += curr;
     }
     mean = sum / D;
     U sum_ivar = 0;
     for (int i = 0; i < D; i++) {
-      U curr = GetData<T, U>(x, j * D + i);
+      U curr = GetAs<T, U>(x, j * D + i);
       sum_ivar += (curr - mean) * (curr - mean);
     }
     ivar = rsqrt(sum_ivar / D + epsilon);
 
     for (int i = 0; i < D; i++) {
-      U curr = GetData<T, U>(x, j * D + i);
+      U curr = GetAs<T, U>(x, j * D + i);
       y[j * D + i] =
           static_cast<T>((curr - mean) * ivar * gamma[i] + beta[i]);
     }
@@ -201,13 +255,14 @@ __global__ void LayerNormGradBetaGamma(const T* __restrict__ dy,
 
   for (int j = blockIdx.x; j < N; j += col_stride) {
     for (int i = tid; i < D; i += row_stride) {
-      U dy_curr = GetData<T, U>(dy, j * D + i);
+      U dy_curr = GetAs<T, U>(dy, j * D + i);
       atomicAdd(dgamma + i, dy_curr * cache_xmu[j * D + i] / cache_xivar[j]);
       atomicAdd(dbeta + i, dy_curr);
     }
   }
 }
 
+// To be replaced with "SetZero<T>".
 template<typename U>
 __global__ void InitGradBetaGamma(U* __restrict__ dgamma, U* __restrict__ dbeta,
                                   int D) {
@@ -244,7 +299,7 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
       for (int j = 0; j < kThreadElements; j++) {
         int row_offset = i * kThreadElements + j;
         if (row_offset < D) {
-          U curr = GetData<T, U>(dy, k * D + row_offset);
+          U curr = GetAs<T, U>(dy, k * D + row_offset);
           thread_data[j] = curr * gamma[row_offset] *
                            cache_xmu[k * D + row_offset] *
                            (-0.5) * pow(cache_xivar[k], -3);
@@ -269,7 +324,7 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
       for (int j = 0; j < kThreadElements; j++) {
         int row_offset = i * kThreadElements + j;
         if (row_offset < D) {
-          U curr = GetData<T, U>(dy, k * D + row_offset);
+          U curr = GetAs<T, U>(dy, k * D + row_offset);
           thread_data[j] = -1. * curr * gamma[row_offset] /
                            cache_xivar[k] + dl_dvar * (-2. / D) *
                            cache_xmu[k * D + row_offset];
@@ -289,7 +344,7 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
     dl_dmu = temp_storage.broadcast[0];
 
     for (int i = tid; i < D; i += row_stride) {
-      U curr = GetData<T, U>(dy, k * D + i);
+      U curr = GetAs<T, U>(dy, k * D + i);
       U dl_di = curr * gamma[i] / cache_xivar[k];
       U di_dx = 1.;
       U dvar_dx = 2. * cache_xmu[k * D + i] / D;
@@ -312,8 +367,9 @@ void LayerNormGradGPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx,
   dim3 threads_init(128, 1, 1);
   dim3 blocks_init((D + 127) / 128, 1, 1);
   InitGradBetaGamma<<<blocks_init, threads_init>>>(dgamma, dbeta, D);
-  dim3 threads(128, 1, 1);
-  dim3 blocks(100, 1, 1);
+
+  dim3 threads(kBlockSize, 1, 1);
+  dim3 blocks(N, 1, 1);
   LayerNormGradBetaGamma<<<blocks, threads>>>(
       dy, cache_xmu, cache_xivar, dgamma, dbeta, N, D);
   cudaEventRecord(stop);
@@ -325,7 +381,7 @@ void LayerNormGradGPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx,
 
   cudaEventRecord(start);
   dim3 threads_input(kBlockSize, 1, 1);
-  dim3 blocks_input(100, 1, 1);
+  dim3 blocks_input(N, 1, 1);
   LayerNormGradInput<<<blocks_input, threads_input>>>(
       dy, gamma, cache_xmu, cache_xivar, dx, N, D);
   cudaEventRecord(stop);
@@ -337,11 +393,11 @@ void LayerNormGradGPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx,
 
 }
 
-#define DTYPE float
-
 template<typename T>
 void PrepareAlloc(T **x, int size, bool use_host, bool human_readable,
-                  int init=-1) {
+                  int seed=99, int init=-1) {
+  srand(seed);
+  int max_int = 32768;
   T *buf_x = new T[size];
   for (int i = 0; i < size; i++) {
     if (init != -1) {
@@ -349,7 +405,7 @@ void PrepareAlloc(T **x, int size, bool use_host, bool human_readable,
     } else if (human_readable) {
       buf_x[i] = i / 10.;
     } else {
-      buf_x[i] = static_cast<T>(static_cast<float>(rand()) / RAND_MAX);
+      buf_x[i] = static_cast<T>(static_cast<float>(rand() % max_int) / max_int);
     }
   }
   if (use_host) {
@@ -365,14 +421,16 @@ void PrepareAlloc(T **x, int size, bool use_host, bool human_readable,
   delete[] buf_x;
 }
 
+#define DTYPE float
+
 int main() {
 
   /** Parameters and Knobs **/
-  int N = 1000;
+  int N = 10000;
   int D = 10000;
   bool allow_print = false;
   bool human_readable = false;
-  bool use_host = true;
+  bool use_host = false;
 
   DTYPE* x;
   float* gamma;
@@ -381,9 +439,9 @@ int main() {
   float* cache_xivar;
   float* cache_xmu;
 
-  PrepareAlloc(&x, N * D, use_host, human_readable);
-  PrepareAlloc(&gamma, D, use_host, human_readable);
-  PrepareAlloc(&beta, D, use_host, human_readable);
+  PrepareAlloc(&x, N * D, use_host, human_readable, 12);
+  PrepareAlloc(&gamma, D, use_host, human_readable, 13);
+  PrepareAlloc(&beta, D, use_host, human_readable, 14);
   PrepareAlloc(&y, N * D, use_host, human_readable);
 
   PrepareAlloc(&cache_xivar, N, use_host, human_readable);
@@ -395,7 +453,7 @@ int main() {
 
   cudaEventRecord(start);
   const dim3 threads(kBlockSize, 1);
-  const dim3 blocks(50, 1, 1);
+  const dim3 blocks(N, 1, 1);
   LayerNormKernel<<<blocks, threads>>>(x, gamma, beta, 0.001f, y, cache_xivar,
                                        cache_xmu, N, D);
   cudaEventRecord(stop);
@@ -403,45 +461,21 @@ int main() {
   cudaEventSynchronize(stop);
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
-  printf("GPU time: %f ms\n", milliseconds);
+  printf("GPU time (y): %f ms\n", milliseconds);
 
   checkCUDA(cudaDeviceSynchronize());
   if (use_host && allow_print) {
-    printf("GPU:\n");
-    for (int i = 0; i < N; i++) {
-      for (int j = 0; j < D; j++) {
-        printf("%f, ", static_cast<float>(y[j + i * D]));
-      }
-      printf("\n");
-    }
+    Print2D(y, N, D, "GPU y:");
   }
 
   if (use_host) {
     DTYPE *y_h = new DTYPE[N * D];
     LayerNormCPU(x, gamma, beta, 0.001f, y_h, N, D);
     if (allow_print) {
-      printf("CPU:\n");
-      for (int i = 0; i < N; i++) {
-        for (int j = 0; j < D; j++) {
-          printf("%f, ", static_cast<float>(y_h[j + i * D]));
-        }
-        printf("\n");
-      }
+      Print2D(y_h, N, D, "CPU y:");
     }
 
-    bool is_same = true;
-    for (int i = 0; i < N; i++) {
-      for (int j = 0; j < D; j++) {
-        float d_val = static_cast<float>(y[j + i * D]);
-        float h_val = static_cast<float>(y_h[j + i * D]);
-        if (abs(d_val - h_val > 0.03f)) {
-          is_same = false;
-          printf("Found diff: CPU=%f, GPU=%f at (%d, %d)\n", h_val, d_val, i, j);
-          break;
-        }
-      }
-    }
-    printf("Test pass: %s\n", is_same ? "True" : "False");
+    IsClose2D(y, y_h, N, D, "y");
     delete[] y_h;
   }
 
@@ -450,7 +484,7 @@ int main() {
   float* dgamma;
   float* dbeta;
 
-  PrepareAlloc(&dy, N * D, use_host, human_readable, 1);
+  PrepareAlloc(&dy, N * D, use_host, human_readable, 99, 1);
   PrepareAlloc(&dx, N * D, use_host, human_readable);
   PrepareAlloc(&dgamma, D, use_host, human_readable);
   PrepareAlloc(&dbeta, D, use_host, human_readable);
@@ -458,23 +492,9 @@ int main() {
   LayerNormGradGPU(dy, cache_xmu, cache_xivar, gamma, dx, dgamma, dbeta, N, D);
   checkCUDA(cudaDeviceSynchronize());
   if (use_host && allow_print) {
-    printf("GPU dgamma:\n");
-    for (int j = 0; j < D; j++) {
-      printf("%f, ", static_cast<float>(dgamma[j]));
-    }
-    printf("\n");
-    printf("GPU dbeta:\n");
-    for (int j = 0; j < D; j++) {
-      printf("%f, ", static_cast<float>(dbeta[j]));
-    }
-    printf("\n");
-    printf("GPU dx:\n");
-    for (int i = 0; i < N; i++) {
-      for (int j = 0; j < D; j++) {
-        printf("%f, ", static_cast<float>(dx[j + i * D]));
-      }
-      printf("\n");
-    }
+    Print1D(dgamma, D, "GPU dgamma:");
+    Print1D(dbeta, D, "GPU dbeta:");
+    Print2D(dx, N, D, "GPU dx:");
   }
 
   if (use_host) {
@@ -484,62 +504,14 @@ int main() {
     LayerNormGradCPU(
         dy, cache_xmu, cache_xivar, gamma, dx_h, dgamma_h, dbeta_h, N, D);
     if (allow_print) {
-      printf("CPU dgamma:\n");
-      for (int j = 0; j < D; j++) {
-        printf("%f, ", static_cast<float>(dgamma_h[j]));
-      }
-      printf("\n");
-      printf("CPU dbeta:\n");
-      for (int j = 0; j < D; j++) {
-        printf("%f, ", static_cast<float>(dbeta_h[j]));
-      }
-      printf("\n");
-      printf("CPU dx:\n");
-      for (int i = 0; i < N; i++) {
-        for (int j = 0; j < D; j++) {
-          printf("%f, ", static_cast<float>(dx_h[j + i * D]));
-        }
-        printf("\n");
-      }
+      Print1D(dgamma_h, D, "CPU dgamma:");
+      Print1D(dbeta_h, D, "CPU dbeta:");
+      Print2D(dx_h, N, D, "CPU dx:");
     }
 
-    bool is_same = true;
-    for (int j = 0; j < D; j++) {
-      float d_val = static_cast<float>(dgamma[j]);
-      float h_val = static_cast<float>(dgamma_h[j]);
-      if (abs(d_val - h_val > 0.03f)) {
-        is_same = false;
-        printf("Found diff: CPU=%f, GPU=%f at (%d,)\n", h_val, d_val, j);
-        break;
-      }
-    }
-    printf("Test pass (dgamma): %s\n", is_same ? "True" : "False");
-
-    is_same = true;
-    for (int j = 0; j < D; j++) {
-      float d_val = static_cast<float>(dbeta[j]);
-      float h_val = static_cast<float>(dbeta_h[j]);
-      if (abs(d_val - h_val > 0.03f)) {
-        is_same = false;
-        printf("Found diff: CPU=%f, GPU=%f at (%d,)\n", h_val, d_val, j);
-        break;
-      }
-    }
-    printf("Test pass (dbeta): %s\n", is_same ? "True" : "False");
-
-    is_same = true;
-    for (int i = 0; i < N; i++) {
-      for (int j = 0; j < D; j++) {
-        float d_val = static_cast<float>(dx[j + i * D]);
-        float h_val = static_cast<float>(dx_h[j + i * D]);
-        if (abs(d_val - h_val > 0.03f)) {
-          is_same = false;
-          printf("Found diff: CPU=%f, GPU=%f at (%d, %d)\n", h_val, d_val, i, j);
-          break;
-        }
-      }
-    }
-    printf("Test pass (dx): %s\n", is_same ? "True" : "False");
+    IsClose1D(dgamma, dgamma_h, D, "dgamma");
+    IsClose1D(dbeta, dbeta_h, D, "dbeta");
+    IsClose2D(dx, dx_h, N, D, "dx");
 
     delete[] dx_h;
     delete[] dgamma_h;
@@ -550,4 +522,8 @@ int main() {
   checkCUDA(cudaFree(gamma));
   checkCUDA(cudaFree(beta));
   checkCUDA(cudaFree(y));
+  checkCUDA(cudaFree(dy));
+  checkCUDA(cudaFree(dx));
+  checkCUDA(cudaFree(dgamma));
+  checkCUDA(cudaFree(dbeta));
 }
