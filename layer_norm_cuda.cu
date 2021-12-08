@@ -522,11 +522,15 @@ void LayerNormGradCPU(const T* dy, const T* x, const U* cache_mean,
 
 #define DTYPE float
 
-int main() {
+int main(int argc, char** argv) {
 
   /** Parameters and Knobs **/
-  int N = 10000000;
-  int D = 10;
+  int N = 10000;
+  int D = 10000;
+  if (argc == 3) {
+    N = atoi(argv[1]);
+    D = atoi(argv[2]);
+  }
   bool allow_print = false;
   bool human_readable = false;
   bool use_host = false;
@@ -609,6 +613,7 @@ int main() {
     delete[] dgamma_h;
     delete[] dbeta_h;
   }
+  // ---- Backward Done Here ----
 
   checkCUDA(cudaFree(x));
   checkCUDA(cudaFree(gamma));
