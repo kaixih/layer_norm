@@ -171,7 +171,48 @@ __global__ void LayerNormKernel(const T* __restrict__ x,
       // Intermediate results to speedup backprop.
       cache_xmu[j * D + i] = curr - mean;
     }
-    cache_xivar[j] = 1.0 / ivar;
+    cache_xivar[j] = ivar;
+  }
+}
+
+template<typename T, typename U>
+__global__ void LayerNormKernelV2Part1(const T* __restrict__ x,
+                                       const U epsilon,
+                                       U* __restrict__ cache_mean,
+                                       U* __restrict__ cache_ivar,
+                                       int N, int D) {
+  const int tid = threadIdx.x;
+  const int col_stride = gridDim.x;
+
+  for (int j = blockIdx.x; j < N; j += col_stride) {
+    U mean, ivar;
+    // GetStats(x + j * D, epsilon, mean, ivar, tid, D);
+    GetStatsV2(x + j * D, epsilon, mean, ivar, tid, D);
+    // Intermediate results to speedup backprop.
+    cache_ivar[j] = ivar;
+    cache_mean[j] = mean;
+  }
+}
+
+template<typename T, typename U>
+__global__ void LayerNormKernelV2Part2(const T* __restrict__ x,
+                                       const U* __restrict__ gamma,
+                                       const U* __restrict__ beta,
+                                       const U* __restrict__ cache_ivar,
+                                       const U* __restrict__ cache_mean,
+                                       const U epsilon,
+                                       T* __restrict__ y,
+                                       int N, int D) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+  if (tid < N * D) {
+    const int col = tid % D;
+    const int row = tid / D;
+    U mean = cache_mean[row];
+    U ivar = cache_ivar[row];
+    U curr = GetAs<T, U>(x, tid);
+    y[tid] =
+        static_cast<T>((curr - mean) * ivar * gamma[col] + beta[col]);
   }
 }
 
@@ -202,7 +243,7 @@ void LayerNormCPU(const T* x, const U* gamma, const U* beta, const U epsilon,
 }
 
 template<typename T, typename U>
-void LayerNormGradCPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx_h,
+void LayerNormGradCPU(T* dy, T* x, U* cache_mean, U* cache_ivar, U* gamma, T* dx_h,
                       U* dgamma_h, U* dbeta_h, int N, int D) {
   // Compute dgamma, dbeta.
   for (int i = 0; i < D; i++) {
@@ -210,7 +251,7 @@ void LayerNormGradCPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx_h,
     dbeta_h[i] = 0;
     for (int j = 0 ; j < N; j++) {
       U dy_curr = static_cast<U>(dy[j * D + i]);
-      dgamma_h[i] += dy_curr * cache_xmu[j * D + i] / cache_xivar[j];
+      dgamma_h[i] += dy_curr * (x[j * D + i] - cache_mean[j]) * cache_ivar[j];
       dbeta_h[i] += dy_curr;
     }
   }
@@ -220,21 +261,21 @@ void LayerNormGradCPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx_h,
     U dl_dvar = 0;
     for (int j = 0; j < D; j++) {
       U curr = static_cast<U>(dy[i * D + j]);
-      dl_dvar += curr * gamma[j] * cache_xmu[i * D + j] * (-0.5) *
-                     pow(cache_xivar[i], -3);
+      dl_dvar += curr * gamma[j] * (x[i * D + j] - cache_mean[i]) * (-0.5) *
+                     (cache_ivar[i] * cache_ivar[i] * cache_ivar[i]);
     }
     U dl_dmu = 0;
     for (int j = 0; j < D; j++) {
       U curr = static_cast<U>(dy[i * D + j]);
-      dl_dmu += -1. * curr * gamma[j] / cache_xivar[i];
-      dl_dmu += dl_dvar * (-2. / D) * cache_xmu[i * D + j];
+      dl_dmu += -1. * curr * gamma[j] * cache_ivar[i];
+      dl_dmu += dl_dvar * (-2. / D) * (x[i * D + j] - cache_mean[i]);
     }
 
     for (int j = 0; j < D; j++) {
       U curr = static_cast<U>(dy[i * D + j]);
-      U dl_di = curr * gamma[j] / cache_xivar[i];
+      U dl_di = curr * gamma[j] * cache_ivar[i];
       U di_dx = 1.;
-      U dvar_dx = 2. * cache_xmu[i * D + j] / D;
+      U dvar_dx = 2. * (x[i * D + j] - cache_mean[i]) / D;
       U dmu_dx = 1. / D;
       U dx = dl_di * di_dx + dl_dvar * dvar_dx + dl_dmu * dmu_dx;
       dx_h[i * D + j] = static_cast<T>(dx);
@@ -256,10 +297,35 @@ __global__ void LayerNormGradBetaGamma(const T* __restrict__ dy,
   for (int j = blockIdx.x; j < N; j += col_stride) {
     for (int i = tid; i < D; i += row_stride) {
       U dy_curr = GetAs<T, U>(dy, j * D + i);
-      atomicAdd(dgamma + i, dy_curr * cache_xmu[j * D + i] / cache_xivar[j]);
+      atomicAdd(dgamma + i, dy_curr * cache_xmu[j * D + i] * cache_xivar[j]);
       atomicAdd(dbeta + i, dy_curr);
     }
   }
+}
+
+// To be replaced with "LaunchColumnReduction".
+// TODO(kaixih): How to prepare the custom op.
+template<typename T, typename U>
+__global__ void LayerNormGradBetaGammaV2(const T* __restrict__ dy,
+                                         const T* __restrict__ x,
+                                         const U* __restrict__ cache_mean,
+                                         const U* __restrict__ cache_ivar,
+                                         U* __restrict__ dgamma,
+                                         U* __restrict__ dbeta, int N, int D) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+  if (tid >= D) return;
+
+  U sum_dgamma = 0;
+  U sum_dbeta = 0;
+  for (int i = 0; i < N; i++) {
+    U dy_curr = GetAs<T, U>(dy, i * D + tid);
+    sum_dgamma += dy_curr * (x[i * D + tid] - cache_mean[i]) * cache_ivar[i];
+    sum_dbeta += dy_curr;
+  }
+
+  dgamma[tid] = sum_dgamma;
+  dbeta[tid] = sum_dbeta;
 }
 
 // To be replaced with "SetZero<T>".
@@ -275,9 +341,10 @@ __global__ void InitGradBetaGamma(U* __restrict__ dgamma, U* __restrict__ dbeta,
 
 template<typename T, typename U>
 __global__ void LayerNormGradInput(const T* __restrict__ dy,
+                                   const T* __restrict__ x,
                                    const U* __restrict__ gamma,
-                                   const U* __restrict__ cache_xmu,
-                                   const U* __restrict__ cache_xivar,
+                                   const U* __restrict__ cache_mean,
+                                   const U* __restrict__ cache_ivar,
                                    T * dx, int N, int D) {
   const int tid = threadIdx.x;
   const int row_stride = blockDim.x;
@@ -301,8 +368,9 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
         if (row_offset < D) {
           U curr = GetAs<T, U>(dy, k * D + row_offset);
           thread_data[j] = curr * gamma[row_offset] *
-                           cache_xmu[k * D + row_offset] *
-                           (-0.5) * pow(cache_xivar[k], -3);
+                           (x[k * D + row_offset] - cache_mean[k]) *
+                           (-0.5) * (cache_ivar[k] * cache_ivar[k] *
+                                     cache_ivar[k]);
         } else {
           thread_data[j] = static_cast<U>(0);
         }
@@ -325,9 +393,9 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
         int row_offset = i * kThreadElements + j;
         if (row_offset < D) {
           U curr = GetAs<T, U>(dy, k * D + row_offset);
-          thread_data[j] = -1. * curr * gamma[row_offset] /
-                           cache_xivar[k] + dl_dvar * (-2. / D) *
-                           cache_xmu[k * D + row_offset];
+          thread_data[j] = -1. * curr * gamma[row_offset] *
+                           cache_ivar[k] + dl_dvar * (-2. / D) *
+                           (x[k * D + row_offset] - cache_mean[k]);
         } else {
           thread_data[j] = static_cast<U>(0);
         }
@@ -345,9 +413,9 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
 
     for (int i = tid; i < D; i += row_stride) {
       U curr = GetAs<T, U>(dy, k * D + i);
-      U dl_di = curr * gamma[i] / cache_xivar[k];
+      U dl_di = curr * gamma[i] * cache_ivar[k];
       U di_dx = 1.;
-      U dvar_dx = 2. * cache_xmu[k * D + i] / D;
+      U dvar_dx = 2. * (x[k * D + i] - cache_mean[k]) / D;
       U dmu_dx = 1. / D;
       U dl_dx = dl_di * di_dx + dl_dvar * dvar_dx + dl_dmu * dmu_dx;
       dx[k * D + i] = static_cast<T>(dl_dx);
@@ -356,8 +424,8 @@ __global__ void LayerNormGradInput(const T* __restrict__ dy,
 }
 
 template<typename T, typename U>
-void LayerNormGradGPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx,
-                      U* dgamma, U* dbeta, int N, int D) {
+void LayerNormGradGPU(T* dy, T* x, U* cache_mean, U* cache_ivar, U* gamma,
+                      T* dx, U* dgamma, U* dbeta, int N, int D) {
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -368,10 +436,14 @@ void LayerNormGradGPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx,
   dim3 blocks_init((D + 127) / 128, 1, 1);
   InitGradBetaGamma<<<blocks_init, threads_init>>>(dgamma, dbeta, D);
 
+  // dim3 threads(kBlockSize, 1, 1);
+  // dim3 blocks(N, 1, 1);
+  // LayerNormGradBetaGamma<<<blocks, threads>>>(
+      // dy, cache_xmu, cache_xivar, dgamma, dbeta, N, D);
   dim3 threads(kBlockSize, 1, 1);
-  dim3 blocks(N, 1, 1);
-  LayerNormGradBetaGamma<<<blocks, threads>>>(
-      dy, cache_xmu, cache_xivar, dgamma, dbeta, N, D);
+  dim3 blocks((D + kBlockSize - 1) / kBlockSize, 1, 1);
+  LayerNormGradBetaGammaV2<<<blocks, threads>>>(
+      dy, x, cache_mean, cache_ivar, dgamma, dbeta, N, D);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -383,7 +455,7 @@ void LayerNormGradGPU(T* dy, U* cache_xmu, U* cache_xivar, U* gamma, T* dx,
   dim3 threads_input(kBlockSize, 1, 1);
   dim3 blocks_input(N, 1, 1);
   LayerNormGradInput<<<blocks_input, threads_input>>>(
-      dy, gamma, cache_xmu, cache_xivar, dx, N, D);
+      dy, x, gamma, cache_mean, cache_ivar, dx, N, D);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -426,8 +498,8 @@ void PrepareAlloc(T **x, int size, bool use_host, bool human_readable,
 int main() {
 
   /** Parameters and Knobs **/
-  int N = 10000;
-  int D = 10000;
+  int N = 10;
+  int D = 10000000;
   bool allow_print = false;
   bool human_readable = false;
   bool use_host = false;
@@ -438,6 +510,8 @@ int main() {
   DTYPE* y;
   float* cache_xivar;
   float* cache_xmu;
+  float* cache_ivar;
+  float* cache_mean;
 
   PrepareAlloc(&x, N * D, use_host, human_readable, 12);
   PrepareAlloc(&gamma, D, use_host, human_readable, 13);
@@ -447,15 +521,26 @@ int main() {
   PrepareAlloc(&cache_xivar, N, use_host, human_readable);
   PrepareAlloc(&cache_xmu, N * D, use_host, human_readable);
 
+  PrepareAlloc(&cache_ivar, N, use_host, human_readable);
+  PrepareAlloc(&cache_mean, N, use_host, human_readable);
+
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
   cudaEventRecord(start);
+  // const dim3 threads(kBlockSize, 1);
+  // const dim3 blocks(N, 1, 1);
+  // LayerNormKernel<<<blocks, threads>>>(x, gamma, beta, 0.001f, y, cache_xivar,
+                                       // cache_xmu, N, D);
   const dim3 threads(kBlockSize, 1);
   const dim3 blocks(N, 1, 1);
-  LayerNormKernel<<<blocks, threads>>>(x, gamma, beta, 0.001f, y, cache_xivar,
-                                       cache_xmu, N, D);
+  LayerNormKernelV2Part1<<<blocks, threads>>>(x, 0.001f, cache_ivar, cache_mean, N, D);
+  const dim3 threads_x(kBlockSize, 1);
+  const dim3 blocks_x((N * D + kBlockSize - 1) / kBlockSize, 1, 1);
+  LayerNormKernelV2Part2<<<blocks_x, threads_x>>>(x, gamma, beta, cache_ivar,
+                                                  cache_mean, 0.001f, y, N, D);
+
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -489,7 +574,7 @@ int main() {
   PrepareAlloc(&dgamma, D, use_host, human_readable);
   PrepareAlloc(&dbeta, D, use_host, human_readable);
 
-  LayerNormGradGPU(dy, cache_xmu, cache_xivar, gamma, dx, dgamma, dbeta, N, D);
+  LayerNormGradGPU(dy, x, cache_mean, cache_ivar, gamma, dx, dgamma, dbeta, N, D);
   checkCUDA(cudaDeviceSynchronize());
   if (use_host && allow_print) {
     Print1D(dgamma, D, "GPU dgamma:");
@@ -502,7 +587,7 @@ int main() {
     float *dgamma_h = new float[D];
     float *dbeta_h = new float[D];
     LayerNormGradCPU(
-        dy, cache_xmu, cache_xivar, gamma, dx_h, dgamma_h, dbeta_h, N, D);
+        dy, x, cache_mean, cache_ivar, gamma, dx_h, dgamma_h, dbeta_h, N, D);
     if (allow_print) {
       Print1D(dgamma_h, D, "CPU dgamma:");
       Print1D(dbeta_h, D, "CPU dbeta:");
