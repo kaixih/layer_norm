@@ -63,7 +63,7 @@ void IsClose2D(const T* x, const T* y, int N, int D, std::string msg) {
     for (int j = 0; j < D; j++) {
       float d_val = static_cast<float>(x[j + i * D]);
       float h_val = static_cast<float>(y[j + i * D]);
-      if (abs(d_val - h_val > 0.03f)) {
+      if (fabs(d_val - h_val) > 0.03f) {
         is_same = false;
         printf("Found diff: CPU=%f, GPU=%f at (%d, %d)\n", h_val, d_val, i, j);
         break;
@@ -78,6 +78,31 @@ template<typename T, typename U>
 __host__ __device__ U GetAs(const T* __restrict__ in, int offset) {
   return static_cast<U>(in[offset]);
 }
+
+template<typename T, typename U>
+struct IvarOps {
+  U *cache_mean;
+  int D;
+  U epsilon;
+  __device__ U fetch(const T *x, const int& row, const int& col) const {
+    U curr = GetAs<T, U>(x, row * D + col);
+    return (curr - cache_mean[row]) * (curr - cache_mean[row]);
+  }
+  __device__ U mean(const U& sum) const {
+    return rsqrt(sum / D + epsilon);
+  }
+};
+
+template<typename T, typename U>
+struct MeanOps {
+  int D;
+  __device__ U fetch(const T *x, const int& row, const int& col) const {
+    return GetAs<T, U>(x, row * D + col);
+  }
+  __device__ U mean(const U& sum) const {
+    return sum / D;
+  }
+};
 
 template<typename T, typename U>
 __device__ void GetStatsNaive(const T* __restrict__ row, const U epsilon,
@@ -138,13 +163,55 @@ __global__ void LayerNormKernelPart1(const T* __restrict__ x, const U epsilon,
                                      const int N, const int D,
                                      U* __restrict__ cache_ivar,
                                      U* __restrict__ cache_mean) {
-  // Assume gridDim.x == N.
-  U mean, ivar;
-  GetStats(x + blockIdx.x * D, epsilon, threadIdx.x, D, mean, ivar);
-  // Intermediate results to speedup backprop.
-  if (threadIdx.x == 0) {
-    cache_ivar[blockIdx.x] = ivar;
-    cache_mean[blockIdx.x] = mean;
+  for (int k = blockIdx.x; k < N; k += gridDim.x) {
+    U mean, ivar;
+    GetStats(x + k * D, epsilon, threadIdx.x, D, mean, ivar);
+    // Intermediate results to speedup backprop.
+    if (threadIdx.x == 0) {
+      cache_ivar[k] = ivar;
+      cache_mean[k] = mean;
+    }
+  }
+}
+
+template<typename T, typename U, typename Op>
+__global__ void LayerNormKernelPart1LongRowInToTemp(
+    const T* __restrict__ x, const int N, const int D,
+    U* __restrict__ temp, Op op) {
+  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+
+  const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
+  
+  for (int row_idx = blockIdx.y; row_idx < N; row_idx += gridDim.y) {
+    U partial_sum = 0;
+    for (int i = row_offset; i < D; i += gridDim.x * blockDim.x) {
+      partial_sum += op.fetch(x, row_idx, i);
+    }
+    U sum = BlockReduce(temp_storage).Sum(partial_sum);
+    if (threadIdx.x == 0) {
+      temp[row_idx * gridDim.x + blockIdx.x] = sum;
+    }
+  }
+}
+
+template<typename U, typename Op>
+__global__ void LayerNormKernelPart1LongRowTempToOut(
+    const U* __restrict__ temp, const int N, const int cols,
+    U* __restrict__ cache, Op op) {
+  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  for (int k = blockIdx.x; k < N; k += gridDim.x) {
+    U partial_sum = 0;
+    for (int i = threadIdx.x; i < cols; i += kBlockSize) {
+      partial_sum += temp[k * cols + i];
+    }
+
+    U sum = BlockReduce(temp_storage).Sum(partial_sum);
+  
+    if (threadIdx.x == 0) {
+      cache[k] = op.mean(sum);
+    }
   }
 }
 
@@ -179,9 +246,38 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
+  const int blocks_per_row = kBlockSize * 100;
+
+  float* temp_ivar;
+  float* temp_sum;
+  PrepareAlloc(&temp_ivar, N * blocks_per_row, false, false);
+  PrepareAlloc(&temp_sum, N * blocks_per_row, false, false);
+
   cudaEventRecord(start);
-  LayerNormKernelPart1<<<N, kBlockSize>>>(x, 0.001f, N, D, cache_ivar,
-                                          cache_mean);
+  if (D <= kBlockSize * blocks_per_row) {
+    LayerNormKernelPart1<<<N, kBlockSize>>>(x, 0.001f, N, D, cache_ivar,
+                                            cache_mean);
+  } else {
+    int max_num_blocks = 1000000; // to be changed.
+    dim3 threads(kBlockSize, 1, 1);
+    dim3 blocks(blocks_per_row, min(N, max_num_blocks / blocks_per_row), 1);
+
+    // Strategy: For long rows, we launch n*x blocks in total, where each x
+    // blocks handle a row. The results will be stored in a temp memory, and its
+    // size is N*x. Then, we launch n*1 blocks in total to reduce the temp
+    // memory and each block will handle one row in temp.
+    MeanOps<U, T> mean_ops{D};
+    LayerNormKernelPart1LongRowInToTemp<<<blocks, threads>>>(
+        x, N, D, temp_sum, mean_ops);
+    LayerNormKernelPart1LongRowTempToOut<<<N, threads>>>(
+        temp_sum, N, blocks_per_row, cache_mean, mean_ops);
+
+    IvarOps<U, T> ivar_ops{cache_mean, D, 0.001f};
+    LayerNormKernelPart1LongRowInToTemp<<<blocks, threads>>>(
+        x, N, D, temp_ivar, ivar_ops);
+    LayerNormKernelPart1LongRowTempToOut<<<N, threads>>>(
+        temp_ivar, N, blocks_per_row, cache_ivar, ivar_ops);
+  }
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -307,35 +403,35 @@ __global__ void LayerNormGradInputPart1(const T* __restrict__ dy,
       U broadcast[1];
   } temp_storage;
   
-  int k = blockIdx.x;
-  
-  U dl_dvar = 0;
-  for (int i = tid; i < D; i += kBlockSize) {
-    U curr = GetAs<T, U>(dy, k * D + i);
-    dl_dvar += curr * gamma[i] * (x[k * D + i] - cache_mean[k]) * (-0.5) *
-               (cache_ivar[k] * cache_ivar[k] * cache_ivar[k]);
-  }
+  for (int k = blockIdx.x; k < N; k += gridDim.x) {
+    U dl_dvar = 0;
+    for (int i = tid; i < D; i += kBlockSize) {
+      U curr = GetAs<T, U>(dy, k * D + i);
+      dl_dvar += curr * gamma[i] * (x[k * D + i] - cache_mean[k]) * (-0.5) *
+                 (cache_ivar[k] * cache_ivar[k] * cache_ivar[k]);
+    }
 
-  dl_dvar = BlockReduce(temp_storage.reduce).Sum(dl_dvar);
+    dl_dvar = BlockReduce(temp_storage.reduce).Sum(dl_dvar);
 
-  if (tid == 0) {
-    temp_storage.broadcast[0] = dl_dvar;
-    dl_dvars[blockIdx.x] = dl_dvar;
-  }
-  __syncthreads();
-  dl_dvar = temp_storage.broadcast[0];
+    if (tid == 0) {
+      temp_storage.broadcast[0] = dl_dvar;
+      dl_dvars[k] = dl_dvar;
+    }
+    __syncthreads();
+    dl_dvar = temp_storage.broadcast[0];
 
-  U dl_dmu = 0;
-  for (int i = tid; i < D; i += kBlockSize) {
-    U curr = GetAs<T, U>(dy, k * D + i);
-    dl_dmu += -1. * curr * gamma[i] * cache_ivar[k] + dl_dvar * (-2. / D) *
-              (x[k * D + i] - cache_mean[k]);
-  }
+    U dl_dmu = 0;
+    for (int i = tid; i < D; i += kBlockSize) {
+      U curr = GetAs<T, U>(dy, k * D + i);
+      dl_dmu += -1. * curr * gamma[i] * cache_ivar[k] + dl_dvar * (-2. / D) *
+                (x[k * D + i] - cache_mean[k]);
+    }
 
-  dl_dmu = BlockReduce(temp_storage.reduce).Sum(dl_dmu);
+    dl_dmu = BlockReduce(temp_storage.reduce).Sum(dl_dmu);
 
-  if (tid == 0) {
-    dl_dmus[blockIdx.x] = dl_dmu;
+    if (tid == 0) {
+      dl_dmus[k] = dl_dmu;
+    }
   }
 }
 
