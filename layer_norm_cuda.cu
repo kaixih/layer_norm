@@ -80,102 +80,75 @@ __host__ __device__ U GetAs(const T* __restrict__ in, int offset) {
 }
 
 template<typename T, typename U>
-struct IvarOps {
-  U *cache_mean;
-  int D;
-  U epsilon;
-  __device__ U fetch(const T *x, const int& row, const int& col) const {
-    U curr = GetAs<T, U>(x, row * D + col);
-    return (curr - cache_mean[row]) * (curr - cache_mean[row]);
-  }
-  __device__ U mean(const U& sum) const {
-    return rsqrt(sum / D + epsilon);
-  }
-};
-
-template<typename T, typename U>
 struct MeanOps {
   int D;
   __device__ U fetch(const T *x, const int& row, const int& col) const {
     return GetAs<T, U>(x, row * D + col);
   }
-  __device__ U mean(const U& sum) const {
+  __device__ U accum(const U& sum) const {
     return sum / D;
   }
 };
 
 template<typename T, typename U>
-__device__ void GetStatsNaive(const T* __restrict__ row, const U epsilon,
-                              const int tid, const int D, U &mean, U &ivar,
-                              int t) {
-  U sum = 0;
-  for (int i = 0; i < D; i++) {
-    sum += GetAs<T, U>(row, i);
+struct IvarOps {
+  U *cache_mean;
+  int D;
+  U epsilon;
+  __device__ U fetch(const T *x, const int& row, const int& col,
+                     const U& mean) const {
+    U curr = GetAs<T, U>(x, row * D + col);
+    return (curr - mean) * (curr - mean);
   }
-  mean = sum / D;
-  U sum_ivar = 0;
-  for (int i = 0; i < D; i++) {
-    U curr = GetAs<T, U>(row, i);
-    sum_ivar += (curr - mean) * (curr - mean);
+  __device__ U fetch(const T *x, const int& row, const int& col) const {
+    return fetch(x, row, col, cache_mean[row]);
   }
-  ivar = rsqrt(sum_ivar / D + epsilon);
-}
+  __device__ U accum(const U& sum) const {
+    return rsqrt(sum / D + epsilon);
+  }
+};
 
-// Essentially, this is a row reduction, which will be conducted twice for the
-// mean and ivar respectively.
 template<typename T, typename U>
-__device__ void GetStats(const T* __restrict__ row, const U epsilon,
-                         const int tid, const int D, U &mean, U &ivar) {
-  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
-  __shared__ union {
-      typename BlockReduce::TempStorage reduce;
-      U broadcast[1];
-  } temp_storage;
-
-  U sum = 0;
-  for (int i = tid; i < D; i += kBlockSize) {
-    sum += GetAs<T, U>(row, i);
+struct DlDvarOps {
+  const U *gamma;
+  const T *x;
+  const U *cache_ivar;
+  const U *cache_mean;
+  int D;
+  __device__ U fetch(const T *dy, const int& row, const int& col) const {
+    U curr = GetAs<T, U>(dy, row * D + col);
+    return curr * gamma[col] * (x[row * D + col] - cache_mean[row]) * (-0.5) *
+           (cache_ivar[row] * cache_ivar[row] * cache_ivar[row]);
   }
-
-  sum = BlockReduce(temp_storage.reduce).Sum(sum);
-  
-  if (tid == 0) {
-    temp_storage.broadcast[0] = sum;
+  __device__ U accum(const U& sum) const {
+    return sum;
   }
-  __syncthreads();
-  mean = temp_storage.broadcast[0] / D;
+};
 
-  U sum_ivar = 0;
-  for (int i = tid; i < D; i += kBlockSize) {
-    U curr = GetAs<T, U>(row, i);
-    sum_ivar += (curr - mean) * (curr - mean);
-  }
-
-  sum_ivar = BlockReduce(temp_storage.reduce).Sum(sum_ivar);
-
-  // Only thread0 has the valid ivar.
-  ivar = rsqrt(sum_ivar / D + epsilon);
-}
-
-// Part1: compute the mean and ivar and store them to a cache.
 template<typename T, typename U>
-__global__ void LayerNormKernelPart1(const T* __restrict__ x, const U epsilon,
-                                     const int N, const int D,
-                                     U* __restrict__ cache_ivar,
-                                     U* __restrict__ cache_mean) {
-  for (int k = blockIdx.x; k < N; k += gridDim.x) {
-    U mean, ivar;
-    GetStats(x + k * D, epsilon, threadIdx.x, D, mean, ivar);
-    // Intermediate results to speedup backprop.
-    if (threadIdx.x == 0) {
-      cache_ivar[k] = ivar;
-      cache_mean[k] = mean;
-    }
+struct DlDmuOps {
+  const U *gamma;
+  const T *x;
+  const U *cache_ivar;
+  const U *cache_mean;
+  const U *dl_dvars;
+  int D;
+  __device__ U fetch(const T *dy, const int& row, const int& col,
+                     const U& dl_dvar) const {
+    U curr = GetAs<T, U>(dy, row * D + col);
+    return -1. * curr * gamma[col] * cache_ivar[row] + dl_dvar *
+           (-2. / D) * (x[row * D + col] - cache_mean[row]);
   }
-}
+  __device__ U fetch(const T *dy, const int& row, const int& col) const {
+    return fetch(dy, row, col, dl_dvars[row]);
+  }
+  __device__ U accum(const U& sum) const {
+    return sum;
+  }
+};
 
 template<typename T, typename U, typename Op>
-__global__ void LayerNormKernelPart1LongRowInToTemp(
+__global__ void LayerNormRowReduceInToTemp(
     const T* __restrict__ x, const int N, const int D,
     U* __restrict__ temp, Op op) {
   typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
@@ -196,7 +169,7 @@ __global__ void LayerNormKernelPart1LongRowInToTemp(
 }
 
 template<typename U, typename Op>
-__global__ void LayerNormKernelPart1LongRowTempToOut(
+__global__ void LayerNormRowReduceTempToOut(
     const U* __restrict__ temp, const int N, const int cols,
     U* __restrict__ cache, Op op) {
   typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
@@ -210,7 +183,7 @@ __global__ void LayerNormKernelPart1LongRowTempToOut(
     U sum = BlockReduce(temp_storage).Sum(partial_sum);
   
     if (threadIdx.x == 0) {
-      cache[k] = op.mean(sum);
+      cache[k] = op.accum(sum);
     }
   }
 }
@@ -250,13 +223,17 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
 
   float* temp_ivar;
   float* temp_sum;
-  PrepareAlloc(&temp_ivar, N * blocks_per_row, false, false);
-  PrepareAlloc(&temp_sum, N * blocks_per_row, false, false);
+  if (D > kBlockSize * blocks_per_row) {
+    PrepareAlloc(&temp_ivar, N * blocks_per_row, false, false);
+    PrepareAlloc(&temp_sum, N * blocks_per_row, false, false);
+  }
 
   cudaEventRecord(start);
+  MeanOps<U, T> mean_ops{D};
+  IvarOps<U, T> ivar_ops{cache_mean, D, 0.001f};
   if (D <= kBlockSize * blocks_per_row) {
-    LayerNormKernelPart1<<<N, kBlockSize>>>(x, 0.001f, N, D, cache_ivar,
-                                            cache_mean);
+    LayerNormRowReduceInToOut<<<N, kBlockSize>>>(
+        x, N, D, cache_mean, cache_ivar, mean_ops, ivar_ops);
   } else {
     int max_num_blocks = 1000000; // to be changed.
     dim3 threads(kBlockSize, 1, 1);
@@ -266,16 +243,14 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
     // blocks handle a row. The results will be stored in a temp memory, and its
     // size is N*x. Then, we launch n*1 blocks in total to reduce the temp
     // memory and each block will handle one row in temp.
-    MeanOps<U, T> mean_ops{D};
-    LayerNormKernelPart1LongRowInToTemp<<<blocks, threads>>>(
+    LayerNormRowReduceInToTemp<<<blocks, threads>>>(
         x, N, D, temp_sum, mean_ops);
-    LayerNormKernelPart1LongRowTempToOut<<<N, threads>>>(
+    LayerNormRowReduceTempToOut<<<N, threads>>>(
         temp_sum, N, blocks_per_row, cache_mean, mean_ops);
 
-    IvarOps<U, T> ivar_ops{cache_mean, D, 0.001f};
-    LayerNormKernelPart1LongRowInToTemp<<<blocks, threads>>>(
+    LayerNormRowReduceInToTemp<<<blocks, threads>>>(
         x, N, D, temp_ivar, ivar_ops);
-    LayerNormKernelPart1LongRowTempToOut<<<N, threads>>>(
+    LayerNormRowReduceTempToOut<<<N, threads>>>(
         temp_ivar, N, blocks_per_row, cache_ivar, ivar_ops);
   }
   cudaEventRecord(stop);
@@ -435,6 +410,46 @@ __global__ void LayerNormGradInputPart1(const T* __restrict__ dy,
   }
 }
 
+template<typename T, typename U, typename Op1, typename Op2>
+__global__ void LayerNormRowReduceInToOut(const T* __restrict__ in,
+                                          const int N, const int D,
+                                          U* out1, U *out2, Op1 op1, Op2 op2) {
+  const int tid = threadIdx.x;
+
+  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
+  __shared__ union {
+      typename BlockReduce::TempStorage reduce;
+      U broadcast[1];
+  } temp_storage;
+  
+  for (int k = blockIdx.x; k < N; k += gridDim.x) {
+    U partial_sum = 0;
+    for (int i = tid; i < D; i += kBlockSize) {
+      partial_sum += op1.fetch(in, k, i);
+    }
+
+    U sum = BlockReduce(temp_storage.reduce).Sum(partial_sum);
+
+    if (tid == 0) {
+      temp_storage.broadcast[0] = op1.accum(sum);
+      out1[k] = op1.accum(sum);
+    }
+    __syncthreads();
+    sum = temp_storage.broadcast[0];
+
+    partial_sum = 0;
+    for (int i = tid; i < D; i += kBlockSize) {
+      partial_sum += op2.fetch(in, k, i, sum);
+    }
+
+    sum = BlockReduce(temp_storage.reduce).Sum(partial_sum);
+
+    if (tid == 0) {
+      out2[k] = op2.accum(sum);
+    }
+  }
+}
+
 // Part2: compute the normalized values.
 template<typename T, typename U>
 __global__ void LayerNormGradInputPart2(const T* __restrict__ dy,
@@ -489,9 +504,36 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
   cudaEventElapsedTime(&milliseconds, start, stop);
   printf("GPU time (dgamma, dbeta): %f ms\n", milliseconds);
 
+  const int blocks_per_row = kBlockSize * 50;
+
+  float* temp_dl_dvars;
+  float* temp_dl_dmus;
+  if (D > kBlockSize * blocks_per_row) {
+    PrepareAlloc(&temp_dl_dvars, N * blocks_per_row, false, false);
+    PrepareAlloc(&temp_dl_dmus, N * blocks_per_row, false, false);
+  }
+
   cudaEventRecord(start);
-  LayerNormGradInputPart1<<<N, kBlockSize>>>(
-      dy, x, gamma, cache_mean, cache_ivar, N, D, temp_1, temp_2);
+  DlDvarOps<U, T> dl_dvar_ops{gamma, x, cache_ivar, cache_mean, D};
+  DlDmuOps<U, T> dl_dmu_ops{gamma, x, cache_ivar, cache_mean, temp_1, D};
+  if (D <= kBlockSize * blocks_per_row) {
+    LayerNormRowReduceInToOut<<<N, kBlockSize>>>(
+        dy, N, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops);
+  } else {
+    int max_num_blocks = 1000000; // to be changed.
+    dim3 threads(kBlockSize, 1, 1);
+    dim3 blocks(blocks_per_row, min(N, max_num_blocks / blocks_per_row), 1);
+
+    LayerNormRowReduceInToTemp<<<blocks, threads>>>(
+        dy, N, D, temp_dl_dvars, dl_dvar_ops);
+    LayerNormRowReduceTempToOut<<<N, threads>>>(
+        temp_dl_dvars, N, blocks_per_row, temp_1, dl_dvar_ops);
+
+    LayerNormRowReduceInToTemp<<<blocks, threads>>>(
+        dy, N, D, temp_dl_dmus, dl_dmu_ops);
+    LayerNormRowReduceTempToOut<<<N, threads>>>(
+        temp_dl_dmus, N, blocks_per_row, temp_2, dl_dmu_ops);
+  }
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
