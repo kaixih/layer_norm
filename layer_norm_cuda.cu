@@ -256,6 +256,7 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
       D <= min_num_blocks * kBlockSize * min_workload_per_thread;
   // Only be used in the multiple blocks per row case.
   const int blocks_per_row = div_up(D, kBlockSize * min_workload_per_thread);
+  bool use_single_warp = D <= kWarpSize;
 
   float* temp_ivar;
   float* temp_sum;
@@ -269,7 +270,11 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
   MeanOp<U, T> mean_ops{D};
   IvarOp<U, T> ivar_ops{cache_mean, D, 0.001f};
   // if (D <= kBlockSize * blocks_per_row) {
-  if (use_single_block) {
+  if (use_single_warp) {
+    printf("AAA using warp kernel\n");
+    LayerNormRowReduceInToOutTest<<<div_up(N, kBlockSize / kWarpSize), kBlockSize>>>(
+        x, N, D, cache_mean, cache_ivar, mean_ops, ivar_ops);
+  } else if (use_single_block) {
     LayerNormRowReduceInToOut<<<N, kBlockSize>>>(
         x, N, D, cache_mean, cache_ivar, mean_ops, ivar_ops);
   } else {
@@ -405,6 +410,55 @@ __global__ void LayerNormGradBetaGamma(const T* __restrict__ dy,
   dbeta[tid] = sum_dbeta;
 }
 
+template<typename T, typename U>
+__global__ void LayerNormGradBetaGammaInToTemp(const T* __restrict__ dy,
+                                               const T* __restrict__ x,
+                                               const U* __restrict__ cache_mean,
+                                               const U* __restrict__ cache_ivar,
+                                               const int N, const int D,
+                                               const int rows,
+                                               U* __restrict__ tgamma,
+                                               U* __restrict__ tbeta) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= D) return;
+
+  // for (int j = tid; j < D; j += blockDim.x) {
+  int j = tid;
+    U sum_dgamma = 0;
+    U sum_dbeta = 0;
+    for (int i = blockIdx.y * rows; i < min(blockIdx.y * rows + rows, N); i++) {
+        U dy_curr = GetAs<T, U>(dy, i * D + j);
+        sum_dgamma += dy_curr * (x[i * D + j] - cache_mean[i]) * cache_ivar[i];
+        sum_dbeta += dy_curr;
+    }
+    tgamma[blockIdx.y * D + j] = sum_dgamma;
+    tbeta[blockIdx.y * D + j] = sum_dbeta;
+  // }
+}
+
+template<typename U>
+__global__ void LayerNormGradBetaGammaTempToOut(const U* __restrict__ tg,
+                                                const U* __restrict__ tb,
+                                                const int N, const int D,
+                                                U* __restrict__ dgamma,
+                                                U* __restrict__ dbeta) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+  if (tid >= D) return;
+
+  U sum_dgamma = 0;
+  U sum_dbeta = 0;
+  for (int i = 0; i < N; i++) {
+    U tg_curr = tg[i * D + tid];
+    U tb_curr = tb[i * D + tid];
+    sum_dgamma += tg_curr;
+    sum_dbeta += tb_curr;
+  }
+
+  dgamma[tid] = sum_dgamma;
+  dbeta[tid] = sum_dbeta;
+}
+  
 // Part1: compute the dl_dvars and dl_dmu and store them to a cache.
 template<typename T, typename U>
 __global__ void LayerNormGradInputPart1(const T* __restrict__ dy,
@@ -494,14 +548,62 @@ __global__ void LayerNormRowReduceInToOut(const T* __restrict__ in,
   }
 }
 
+template<typename T, typename U, typename Op1, typename Op2>
+__global__ void LayerNormRowReduceInToOutTest(const T* __restrict__ in,
+                                          const int N, const int D,
+                                          U* out1, U *out2, Op1 op1, Op2 op2) {
+  const int tid = threadIdx.x % kWarpSize;
+
+  const int num_warps = kBlockSize / kWarpSize;
+  typedef cub::WarpReduce<U> WarpReduce;
+  // __shared__ union {
+    // typename WarpReduce::TempStorage reduce[num_warps];
+    // U broadcast[num_warps];
+  // } temp_storage;
+  typename WarpReduce::TempStorage temp_storage[num_warps];
+
+  const int local_warp_id = threadIdx.x / kWarpSize;
+  const int warp_id = blockIdx.x * num_warps + local_warp_id;
+  
+  for (int k = warp_id; k < N; k += gridDim.x * num_warps) {
+    U partial_sum = 0;
+    for (int i = tid; i < D; i += kWarpSize) {
+      partial_sum += op1.Compute(in, k, i);
+    }
+
+    // U sum = WarpReduce(temp_storage.reduce[local_warp_id]).Sum(partial_sum);
+    U sum = WarpReduce(temp_storage[local_warp_id]).Sum(partial_sum);
+
+    sum = cub::ShuffleIndex<kWarpSize>(sum, 0, 0xffffffff);
+    // if (tid == 0) {
+      // temp_storage.broadcast[local_warp_id] = op1.Finalize(sum);
+      out1[k] = op1.Finalize(sum);
+    // }
+    // __syncthreads();
+    // sum = temp_storage.broadcast[local_warp_id];
+
+    partial_sum = 0;
+    for (int i = tid; i < D; i += kWarpSize) {
+      partial_sum += op2.Compute(in, k, i, sum);
+    }
+
+    // sum = WarpReduce(temp_storage.reduce[local_warp_id]).Sum(partial_sum);
+    sum = WarpReduce(temp_storage[local_warp_id]).Sum(partial_sum);
+
+    if (tid == 0) {
+      out2[k] = op2.Finalize(sum);
+    }
+  }
+}
+
 
 template<typename T, typename U>
 void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
                       const U* cache_ivar, const U* gamma, const int N,
                       const int D, T* dx, U* dgamma, U* dbeta) {
 
-  U* temp_1;
-  U* temp_2;
+  U* temp_1; // dl_dvars
+  U* temp_2; // dl_dmus
   PrepareAlloc(&temp_1, N, false, false);
   PrepareAlloc(&temp_2, N, false, false);
 
@@ -510,14 +612,32 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
   cudaEventCreate(&stop);
 
   cudaEventRecord(start);
-  InitGradBetaGamma<<<div_up(D, kBlockSize), kBlockSize>>>(dgamma, dbeta, D);
 
-  if (N <= D) {
+  const int min_rows_per_block = 10000;
+  bool use_temp_space = N > min_rows_per_block;
+  // bool use_temp_space = false;
+  U* temp_dgamma;
+  U* temp_dbeta;
+
+  if (!use_temp_space) {
+    printf("XXX old\n");
     LayerNormGradBetaGamma<<<div_up(D, kBlockSize), kBlockSize>>>(
         dy, x, cache_mean, cache_ivar, N, D, dgamma, dbeta);
+  // } else {
+    // InitGradBetaGamma<<<div_up(D, kBlockSize), kBlockSize>>>(dgamma, dbeta, D);
+    // LayerNormGradBetaGammaAtomic<<<N, kBlockSize>>>(
+        // dy, x, cache_mean, cache_ivar, N, D, dgamma, dbeta);
   } else {
-    LayerNormGradBetaGammaAtomic<<<N, kBlockSize>>>(
-        dy, x, cache_mean, cache_ivar, N, D, dgamma, dbeta);
+    printf("XXX new\n");
+    const int reduced_rows = div_up(N, min_rows_per_block);
+    PrepareAlloc(&temp_dgamma, reduced_rows * D, false, false);
+    PrepareAlloc(&temp_dbeta, reduced_rows * D, false, false);
+    dim3 blocks(div_up(D, kBlockSize), reduced_rows);
+    LayerNormGradBetaGammaInToTemp<<<blocks, kBlockSize>>>(
+        dy, x, cache_mean, cache_ivar, N, D, min_rows_per_block, temp_dgamma,
+        temp_dbeta);
+    LayerNormGradBetaGammaTempToOut<<<div_up(D, kBlockSize), kBlockSize>>>(
+        temp_dgamma, temp_dbeta, reduced_rows, D, dgamma, dbeta);
   }
   cudaEventRecord(stop);
 
@@ -533,6 +653,7 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
       D <= min_num_blocks * kBlockSize * min_workload_per_thread;
   // Only be used in the multiple blocks per row case.
   const int blocks_per_row = div_up(D, kBlockSize * min_workload_per_thread);
+  bool use_single_warp = D <= kWarpSize;
 
   float* temp_dl_dvars;
   float* temp_dl_dmus;
@@ -546,7 +667,11 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
   DvarOp<U, T> dl_dvar_ops{gamma, x, cache_ivar, cache_mean, D};
   DmeanOp<U, T> dl_dmu_ops{gamma, x, cache_ivar, cache_mean, temp_1, D};
   // if (D <= kBlockSize * blocks_per_row) {
-  if (use_single_block) {
+  if (use_single_warp) {
+    printf("AAA using warp kernel\n");
+    LayerNormRowReduceInToOutTest<<<div_up(N, kBlockSize / kWarpSize), kBlockSize>>>(
+        dy, N, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops);
+  } else if (use_single_block) {
     LayerNormRowReduceInToOut<<<N, kBlockSize>>>(
         dy, N, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops);
   } else {
@@ -643,13 +768,16 @@ int main(int argc, char** argv) {
   /** Parameters and Knobs **/
   int N = 10000;
   int D = 10000;
-  if (argc == 3) {
+  if (argc >= 3) {
     N = atoi(argv[1]);
     D = atoi(argv[2]);
   }
   bool allow_print = false;
   bool human_readable = false;
   bool use_host = false;
+  if (argc >= 4) {
+    use_host = atoi(argv[3]);
+  }
 
   DTYPE* x;
   float* gamma;
