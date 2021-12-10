@@ -12,6 +12,7 @@
 }
 
 const int kBlockSize = 128;
+const int kWarpSize = 32;
 
 int div_up(int a, int b) {
   return (a + b - 1) / b;
@@ -47,6 +48,7 @@ void PrepareAlloc(T **x, int size, bool use_host, bool human_readable,
 
 template<typename T>
 void Print2D(const T* x, int N, int D, std::string msg) {
+  checkCUDA(cudaDeviceSynchronize());
   printf("%s\n", msg.c_str());
   for (int i = 0; i < N; i++) {
     for (int j = 0; j < D; j++) {
@@ -147,6 +149,43 @@ struct DlDmuOps {
   }
 };
 
+template<typename T, typename U>
+struct DxOps {
+  const T *x;
+  const U *cache_mean;
+  const U *cache_ivar;
+  const U *gamma;
+  const U *dl_dvars;
+  const U *dl_dmus;
+  int D;
+  __device__ T update(const T *dy, const int& row, const int& col) const {
+    U curr = GetAs<T, U>(dy, row * D + col);
+    U dl_di = curr * gamma[col] * cache_ivar[row];
+    U di_dx = 1.;
+    U dvar_dx = 2. * (x[row * D + col] - cache_mean[row]) / D;
+    U dmu_dx = 1. / D;
+    U dl_dx = dl_di * di_dx + dl_dvars[row] * dvar_dx + dl_dmus[row] * dmu_dx;
+    return static_cast<T>(dl_dx);
+  }
+};
+
+template<typename T, typename U>
+struct YOps {
+  const U *cache_mean;
+  const U *cache_ivar;
+  const U *gamma;
+  const U *beta;
+  int D;
+  __device__ T update(const T *x, const int& row, const int& col) const {
+    U mean = cache_mean[row];
+    U ivar = cache_ivar[row];
+    U curr = GetAs<T, U>(x, row * D + col);
+    return static_cast<T>((curr - mean) * ivar * gamma[col] + beta[col]);
+  }
+};
+
+
+
 template<typename T, typename U, typename Op>
 __global__ void LayerNormRowReduceInToTemp(
     const T* __restrict__ x, const int N, const int D,
@@ -188,28 +227,20 @@ __global__ void LayerNormRowReduceTempToOut(
   }
 }
 
-// Part2: compute the normalized values.
-template<typename T, typename U>
-__global__ void LayerNormKernelPart2(const T* __restrict__ x,
-                                     const U* __restrict__ gamma,
-                                     const U* __restrict__ beta,
-                                     const U* __restrict__ cache_ivar,
-                                     const U* __restrict__ cache_mean,
-                                     const U epsilon,
-                                     const int N, const int D,
-                                     T* __restrict__ y) {
+template<typename T, typename Op>
+__global__ void LayerNormUpdate(const T* __restrict__ in, const int N,
+                                const int D, T * out, Op op) {
+
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
   if (tid >= N * D) return;
 
   const int col = tid % D;
   const int row = tid / D;
-
-  U mean = cache_mean[row];
-  U ivar = cache_ivar[row];
-  U curr = GetAs<T, U>(x, tid);
-  y[tid] = static_cast<T>((curr - mean) * ivar * gamma[col] + beta[col]);
+  out[tid] = op.update(in, row, col);
 }
+
+
 
 template<typename T, typename U>
 void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
@@ -219,11 +250,18 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  const int blocks_per_row = kBlockSize * 100;
+  // const int blocks_per_row = kBlockSize * 100;
+  const int min_num_blocks = kWarpSize;
+  const int min_workload_per_thread = 100;
+  bool use_single_block =
+      D <= min_num_blocks * kBlockSize * min_workload_per_thread;
+  // Only be used in the multiple blocks per row case.
+  const int blocks_per_row = div_up(D, kBlockSize * min_workload_per_thread);
 
   float* temp_ivar;
   float* temp_sum;
-  if (D > kBlockSize * blocks_per_row) {
+  // if (D > kBlockSize * blocks_per_row) {
+  if (!use_single_block) {
     PrepareAlloc(&temp_ivar, N * blocks_per_row, false, false);
     PrepareAlloc(&temp_sum, N * blocks_per_row, false, false);
   }
@@ -231,13 +269,15 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
   cudaEventRecord(start);
   MeanOps<U, T> mean_ops{D};
   IvarOps<U, T> ivar_ops{cache_mean, D, 0.001f};
-  if (D <= kBlockSize * blocks_per_row) {
+  // if (D <= kBlockSize * blocks_per_row) {
+  if (use_single_block) {
     LayerNormRowReduceInToOut<<<N, kBlockSize>>>(
         x, N, D, cache_mean, cache_ivar, mean_ops, ivar_ops);
   } else {
     int max_num_blocks = 1000000; // to be changed.
     dim3 threads(kBlockSize, 1, 1);
     dim3 blocks(blocks_per_row, min(N, max_num_blocks / blocks_per_row), 1);
+    printf("AAA blocks_per_row: %d\n", blocks_per_row);
 
     // Strategy: For long rows, we launch n*x blocks in total, where each x
     // blocks handle a row. The results will be stored in a temp memory, and its
@@ -261,14 +301,19 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
   printf("GPU time (y) p1: %f ms\n", milliseconds);
 
   cudaEventRecord(start);
-  LayerNormKernelPart2<<<div_up(N * D, kBlockSize), kBlockSize>>>(
-      x, gamma, beta, cache_ivar, cache_mean, 0.001f, N, D, y);
+  YOps<T, U> y_ops{cache_mean, cache_ivar, gamma, beta, D};
+  LayerNormUpdate<<<div_up(N * D, kBlockSize), kBlockSize>>>(x, N, D, y, y_ops);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
   milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
   printf("GPU time (y) p2: %f ms\n", milliseconds);
+
+  if (!use_single_block) {
+    checkCUDA(cudaFree(temp_ivar));
+    checkCUDA(cudaFree(temp_sum));
+  }
 }
 
 template<typename T, typename U>
@@ -450,38 +495,16 @@ __global__ void LayerNormRowReduceInToOut(const T* __restrict__ in,
   }
 }
 
-// Part2: compute the normalized values.
-template<typename T, typename U>
-__global__ void LayerNormGradInputPart2(const T* __restrict__ dy,
-                                        const T* __restrict__ x,
-                                        const U* __restrict__ gamma,
-                                        const U* __restrict__ cache_mean,
-                                        const U* __restrict__ cache_ivar,
-                                        const U* dl_dvars, const U *dl_dmus,
-                                        const int N, const int D,
-                                        T * dx) {
-
-  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-  if (tid >= N * D) return;
-
-  const int col = tid % D;
-  const int row = tid / D;
-
-  U curr = GetAs<T, U>(dy, row * D + col);
-  U dl_di = curr * gamma[col] * cache_ivar[row];
-  U di_dx = 1.;
-  U dvar_dx = 2. * (x[row * D + col] - cache_mean[row]) / D;
-  U dmu_dx = 1. / D;
-  U dl_dx = dl_di * di_dx + dl_dvars[row] * dvar_dx + dl_dmus[row] * dmu_dx;
-  dx[row * D + col] = static_cast<T>(dl_dx);
-}
 
 template<typename T, typename U>
 void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
                       const U* cache_ivar, const U* gamma, const int N,
-                      const int D, U* temp_1, U* temp_2, T* dx, U* dgamma,
-                      U* dbeta) {
+                      const int D, T* dx, U* dgamma, U* dbeta) {
+
+  U* temp_1;
+  U* temp_2;
+  PrepareAlloc(&temp_1, N, false, false);
+  PrepareAlloc(&temp_2, N, false, false);
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -504,11 +527,18 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
   cudaEventElapsedTime(&milliseconds, start, stop);
   printf("GPU time (dgamma, dbeta): %f ms\n", milliseconds);
 
-  const int blocks_per_row = kBlockSize * 50;
+  // const int blocks_per_row = kBlockSize * 50;
+  const int min_num_blocks = kWarpSize;
+  const int min_workload_per_thread = 50;
+  bool use_single_block =
+      D <= min_num_blocks * kBlockSize * min_workload_per_thread;
+  // Only be used in the multiple blocks per row case.
+  const int blocks_per_row = div_up(D, kBlockSize * min_workload_per_thread);
 
   float* temp_dl_dvars;
   float* temp_dl_dmus;
-  if (D > kBlockSize * blocks_per_row) {
+  // if (D > kBlockSize * blocks_per_row) {
+  if (!use_single_block) {
     PrepareAlloc(&temp_dl_dvars, N * blocks_per_row, false, false);
     PrepareAlloc(&temp_dl_dmus, N * blocks_per_row, false, false);
   }
@@ -516,13 +546,15 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
   cudaEventRecord(start);
   DlDvarOps<U, T> dl_dvar_ops{gamma, x, cache_ivar, cache_mean, D};
   DlDmuOps<U, T> dl_dmu_ops{gamma, x, cache_ivar, cache_mean, temp_1, D};
-  if (D <= kBlockSize * blocks_per_row) {
+  // if (D <= kBlockSize * blocks_per_row) {
+  if (use_single_block) {
     LayerNormRowReduceInToOut<<<N, kBlockSize>>>(
         dy, N, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops);
   } else {
     int max_num_blocks = 1000000; // to be changed.
     dim3 threads(kBlockSize, 1, 1);
     dim3 blocks(blocks_per_row, min(N, max_num_blocks / blocks_per_row), 1);
+    printf("AAA blocks_per_row: %d\n", blocks_per_row);
 
     LayerNormRowReduceInToTemp<<<blocks, threads>>>(
         dy, N, D, temp_dl_dvars, dl_dvar_ops);
@@ -542,14 +574,22 @@ void LayerNormGradGPU(const T* dy, const T* x, const U* cache_mean,
   printf("GPU time (dx) p1: %f ms\n", milliseconds);
 
   cudaEventRecord(start);
-  LayerNormGradInputPart2<<<div_up(N * D, kBlockSize), kBlockSize>>>(
-      dy, x, gamma, cache_mean, cache_ivar, temp_1, temp_2, N, D, dx);
+  DxOps<T, U> dx_ops{x, cache_mean, cache_ivar, gamma, temp_1, temp_2, D};
+  LayerNormUpdate<<<div_up(N * D, kBlockSize), kBlockSize>>>(
+      dy, N, D, dx, dx_ops);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
   milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
   printf("GPU time (dx) p2: %f ms\n", milliseconds);
+
+  checkCUDA(cudaFree(temp_1));
+  checkCUDA(cudaFree(temp_2));
+  if (!use_single_block) {
+    checkCUDA(cudaFree(temp_dl_dvars));
+    checkCUDA(cudaFree(temp_dl_dmus));
+  }
 }
 
 template<typename T, typename U>
@@ -628,7 +668,6 @@ int main(int argc, char** argv) {
   PrepareAlloc(&cache_mean, N, use_host, human_readable);
 
   LayerNormGPU(x, gamma, beta, 0.001f, N, D, y, cache_ivar, cache_mean);
-  checkCUDA(cudaDeviceSynchronize());
   if (use_host && allow_print) {
     Print2D(y, N, D, "GPU y:");
   }
@@ -650,20 +689,14 @@ int main(int argc, char** argv) {
   float* dgamma;
   float* dbeta;
 
-  float* temp1;
-  float* temp2;
-
   PrepareAlloc(&dy, N * D, use_host, human_readable, 99, 1);
   PrepareAlloc(&dx, N * D, use_host, human_readable);
   PrepareAlloc(&dgamma, D, use_host, human_readable);
   PrepareAlloc(&dbeta, D, use_host, human_readable);
 
-  PrepareAlloc(&temp1, N, use_host, human_readable);
-  PrepareAlloc(&temp2, N, use_host, human_readable);
 
-  LayerNormGradGPU(dy, x, cache_mean, cache_ivar, gamma, N, D, temp1, temp2, dx,
-                   dgamma, dbeta);
-  checkCUDA(cudaDeviceSynchronize());
+  LayerNormGradGPU(dy, x, cache_mean, cache_ivar, gamma, N, D, dx, dgamma,
+                   dbeta);
   if (use_host && allow_print) {
     Print2D(dgamma, 1, D, "GPU dgamma:");
     Print2D(dbeta, 1, D, "GPU dbeta:");
@@ -702,6 +735,4 @@ int main(int argc, char** argv) {
   checkCUDA(cudaFree(dbeta));
   checkCUDA(cudaFree(cache_mean));
   checkCUDA(cudaFree(cache_ivar));
-  checkCUDA(cudaFree(temp1));
-  checkCUDA(cudaFree(temp2));
 }
