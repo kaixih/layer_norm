@@ -1,43 +1,86 @@
 import numpy as np
 import tensorflow as tf
+import time
+
+from ctypes import CDLL
 
 epsilon = 0.001
 
-input_shape = (3, 2, 4)
-feature_axis = (1, 2)
-human_readable = True
+input_shape = (3, 8)
+feature_axis = (1,)
+human_readable = False
+use_rand = True
+allow_print = True
+
+clib_path = "/usr/lib/x86_64-linux-gnu/libc-2.31.so"
+libc = CDLL(clib_path)
+# Generate random numbers. To sync with the C++ results, we use rand() from
+# libc.so.
+def get_random_array(shape, seed):
+  libc.srand(seed)
+  max_int = 32768
+  n = np.prod(shape)
+  x_list = [float(libc.rand() % max_int) / max_int for i in range(n)]
+  x = np.array(x_list).reshape(shape)
+  return tf.convert_to_tensor(x)
 
 # Data preparation
 ndims = len(input_shape)
-nelems = np.prod(input_shape)
 feature_shape=[]
 for axis in feature_axis:
   feature_shape.append(input_shape[axis])
-nfeatures = np.prod(feature_shape)
 if human_readable:
+  nelems = np.prod(input_shape)
   data = tf.cast(tf.reshape(tf.range(nelems), shape=input_shape), dtype=tf.float32) / 10.
-  gamma = tf.cast(tf.reshape(tf.range(nfeatures), shape=feature_shape), dtype=tf.float32) / 10.
-  beta = tf.cast(tf.reshape(tf.range(nfeatures), shape=feature_shape), dtype=tf.float32) / 10.
+  gamma = tf.ones(feature_shape)
+  beta = tf.zeros(feature_shape)
 else:
-  data = tf.random.normal(shape=input_shape)
-  gamma = tf.random.normal(shape=feature_shape)
-  beta = tf.random.normal(shape=feature_shape)
+  if use_rand:
+    data = get_random_array(input_shape, seed=12)
+    gamma = get_random_array(feature_shape, seed=13)
+    beta = get_random_array(feature_shape, seed=14)
+  else:
+    data = tf.random.normal(input_shape)
+    gamma = tf.random.normal(feature_shape)
+    beta = tf.random.normal(feature_shape)
+
+print("Data has been prepared!")
 
 # Keras Solution (Reference):
 layer = tf.keras.layers.LayerNormalization(axis=feature_axis)
 layer.build(input_shape=input_shape)
 layer.set_weights([gamma, beta])
 
-with tf.GradientTape() as tape:
-  tape.watch(data)
-  output = layer(data)
-  loss = tf.reduce_sum(output)
-dx, dy, (dgamma, dbeta) = tape.gradient(loss, [data, output, layer.variables])
-print("Keras y:", output)
-print("Keras dy:", dy)
-print("Keras dx:", dx)
-print("Keras dgamma:", dgamma)
-print("Keras dbeta:", dbeta)
+def train_step():
+  with tf.GradientTape() as tape:
+    tape.watch(data)
+    output = layer(data)
+    loss = tf.reduce_sum(output)
+  dx, dy, (dgamma, dbeta) = tape.gradient(loss, [data, output, layer.variables])
+  return dx, dy, dgamma, dbeta, output
+
+
+warmup = 100
+repeat = 1000
+for i in range(warmup):
+  dx, dy, dgamma, dbeta, output = train_step()
+_ = tf.reduce_sum(dx)
+
+start = time.time()
+for i in range(repeat):
+  dx, dy, dgamma, dbeta, output = train_step()
+_ = tf.reduce_sum(dx)
+
+result = time.time() - start
+print("Time: {:0.2f} ms".format(1000 * result / repeat))
+print("Keras is done!")
+
+if allow_print:
+  print("Keras y:", output)
+  print("Keras dx:", dx)
+  print("Keras dgamma:", dgamma)
+  print("Keras dbeta:", dbeta)
+
 
 # Numpy Solution:
 def forward(x, g, b, feature_axis):
