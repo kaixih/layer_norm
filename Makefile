@@ -4,4 +4,4 @@ all:
 	nvcc -o layer_norm.out layer_norm.cu layer_norm.o
 
 clean:
-	rm -rf *.so *.o
+	rm -rf *.so *.o *.out

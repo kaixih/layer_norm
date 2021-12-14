@@ -1,18 +1,18 @@
-#include<iostream>
-#include<cmath>
+#include <cmath>
+#include <iostream>
 
-template<typename T, typename U>
+template <typename T, typename U>
 U GetAs(const T* in, int offset) {
   return static_cast<U>(in[offset]);
 }
 
-template<typename T, typename U>
+template <typename T, typename U>
 void LayerNormCPU(const T* x, const U* gamma, const U* beta, const int N,
                   const int D, const U epsilon, T* y) {
-  for(int j = 0; j < N; j++) {
+  for (int j = 0; j < N; j++) {
     U mean, ivar;
     U sum = 0;
-    for(int i = 0; i < D; i++) {
+    for (int i = 0; i < D; i++) {
       U curr = GetAs<T, U>(x, j * D + i);
       sum += curr;
     }
@@ -32,16 +32,16 @@ void LayerNormCPU(const T* x, const U* gamma, const U* beta, const int N,
   }
 }
 
-template<typename T, typename U>
+template <typename T, typename U>
 void LayerNormGradCPU(const T* dy, const T* x, const U* gamma, const int N,
                       const int D, const U epsilon, U* dgamma, U* dbeta,
                       T* dx) {
-  U *cache_mean = new U[N];
-  U *cache_ivar = new U[N];
-  for(int j = 0; j < N; j++) {
+  U* cache_mean = new U[N];
+  U* cache_ivar = new U[N];
+  for (int j = 0; j < N; j++) {
     U mean, ivar;
     U sum = 0;
-    for(int i = 0; i < D; i++) {
+    for (int i = 0; i < D; i++) {
       U curr = GetAs<T, U>(x, j * D + i);
       sum += curr;
     }
@@ -62,7 +62,7 @@ void LayerNormGradCPU(const T* dy, const T* x, const U* gamma, const int N,
   for (int i = 0; i < D; i++) {
     dgamma[i] = 0;
     dbeta[i] = 0;
-    for (int j = 0 ; j < N; j++) {
+    for (int j = 0; j < N; j++) {
       U dy_curr = static_cast<U>(dy[j * D + i]);
       dgamma[i] += dy_curr * (x[j * D + i] - cache_mean[j]) * cache_ivar[j];
       dbeta[i] += dy_curr;
@@ -75,7 +75,7 @@ void LayerNormGradCPU(const T* dy, const T* x, const U* gamma, const int N,
     for (int j = 0; j < D; j++) {
       U curr = static_cast<U>(dy[i * D + j]);
       dl_dvar += curr * gamma[j] * (x[i * D + j] - cache_mean[i]) * (-0.5) *
-                     (cache_ivar[i] * cache_ivar[i] * cache_ivar[i]);
+                 (cache_ivar[i] * cache_ivar[i] * cache_ivar[i]);
     }
 
     U dl_dmean = 0;
@@ -106,16 +106,14 @@ void LayerNormGradCPU(const T* dy, const T* x, const U* gamma, const int N,
 }
 
 extern "C" {
-  void layer_norm(const float* x, const float* gamma, const float* beta,
-                  const int N, const int D, const float epsilon, float* y) {
-    LayerNormCPU(x, gamma, beta, N, D, epsilon, y);
-  }
-
-  void layer_norm_grad(const float* dy, const float* x, const float* gamma,
-                       const int N, const int D, const float epsilon,
-                       float* dx, float* dgamma, float* dbeta) {
-    LayerNormGradCPU(dy, x, gamma, N, D, epsilon, dgamma, dbeta, dx); 
-  }
+void layer_norm(const float* x, const float* gamma, const float* beta,
+                const int N, const int D, const float epsilon, float* y) {
+  LayerNormCPU(x, gamma, beta, N, D, epsilon, y);
 }
 
-
+void layer_norm_grad(const float* dy, const float* x, const float* gamma,
+                     const int N, const int D, const float epsilon, float* dx,
+                     float* dgamma, float* dbeta) {
+  LayerNormGradCPU(dy, x, gamma, N, D, epsilon, dgamma, dbeta, dx);
+}
+}
