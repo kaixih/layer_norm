@@ -1,6 +1,8 @@
-# Layer Normalization Backprop
-This repo demonstrate how the forward and backward layer norm work. The
-reference is LayerNormalization layer from Keras.
+# Layer Normalization
+This repo implements the Layer Normalization with different programming
+languages or libraries: Tensorflow (Keras), Numpy, C++, Eigen, CUDA. Each sample
+includes both the forward and backward passes and results are checked compared
+with Keras's LayerNormalization layer.
 
 ## Layer Normalization Forward Pass
 Suppose <img src="https://render.githubusercontent.com/render/math?math=N, D"> are batch and feature dimensions respectively.
