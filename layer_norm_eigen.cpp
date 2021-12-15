@@ -1,10 +1,11 @@
-#include <iostream>
 #include <time.h>
+
+#include <iostream>
 #include <unsupported/Eigen/CXX11/Tensor>
 
 template <typename T>
 void IsClose2DHost(const T* x, const T* y, int N, int D, std::string msg,
-                   float atol=1e-3, float rtol=1e-3);
+                   float atol = 1e-3, float rtol = 1e-3);
 
 template <typename T>
 void Print2DHost(const T* x, int N, int D, std::string msg);
@@ -17,7 +18,6 @@ template <typename T, typename U>
 void LayerNormGradCPU(const T* dy, const T* x, const U* gamma, const int N,
                       const int D, const U epsilon, U* dgamma, U* dbeta, T* dx);
 
- 
 #define DTYPE float
 
 template <typename T>
@@ -32,21 +32,19 @@ void InitAlloc(T* x, int size, int init = -1) {
   }
 }
 
-template<typename T>
+template <typename T>
 void SetEigenTensor(T* out, T* in, int size) {
   for (int i = 0; i < size; i++) {
     out[i] = in[i];
   }
 }
 
-template<typename T, typename U>
-void LayerNormEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor> &in,
-                    const Eigen::Tensor<U, 1, Eigen::RowMajor> &scale,
-                    const Eigen::Tensor<U, 1, Eigen::RowMajor> &offset,
-                    const int N, const int D,
-                    const U epsilon,
-                    Eigen::Tensor<T, 2, Eigen::RowMajor> &y) {
-
+template <typename T, typename U>
+void LayerNormEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor>& in,
+                    const Eigen::Tensor<U, 1, Eigen::RowMajor>& scale,
+                    const Eigen::Tensor<U, 1, Eigen::RowMajor>& offset,
+                    const int N, const int D, const U epsilon,
+                    Eigen::Tensor<T, 2, Eigen::RowMajor>& y) {
   Eigen::array<int, 1> reduce_dims({1});
   Eigen::DSizes<Eigen::Index, 2> N_by_one(N, 1);
   Eigen::DSizes<Eigen::Index, 2> one_by_D(1, D);
@@ -74,13 +72,13 @@ void LayerNormEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor> &in,
 }
 
 template <typename T, typename U>
-void LayerNormGradEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor> &dy,
-                        const Eigen::Tensor<T, 2, Eigen::RowMajor> &in,
-                        const Eigen::Tensor<U, 1, Eigen::RowMajor> &scale,
+void LayerNormGradEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor>& dy,
+                        const Eigen::Tensor<T, 2, Eigen::RowMajor>& in,
+                        const Eigen::Tensor<U, 1, Eigen::RowMajor>& scale,
                         const int N, const int D, const U epsilon,
-                        Eigen::Tensor<U, 1, Eigen::RowMajor> &dscale,
-                        Eigen::Tensor<U, 1, Eigen::RowMajor> &doffset,
-                        Eigen::Tensor<T, 2, Eigen::RowMajor> &dx) {
+                        Eigen::Tensor<U, 1, Eigen::RowMajor>& dscale,
+                        Eigen::Tensor<U, 1, Eigen::RowMajor>& doffset,
+                        Eigen::Tensor<T, 2, Eigen::RowMajor>& dx) {
   Eigen::array<int, 1> reduce_D({1});
   Eigen::array<int, 1> reduce_N({0});
   Eigen::DSizes<Eigen::Index, 2> N_by_one(N, 1);
@@ -99,7 +97,7 @@ void LayerNormGradEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor> &dy,
   auto variance = x_centered.square().sum(reduce_D) * D_inv;
 
   ivar =
-      ((variance + epsilon).rsqrt().eval().reshape(N_by_one).broadcast(bcast_D));
+      (variance + epsilon).rsqrt().eval().reshape(N_by_one).broadcast(bcast_D);
 
   dscale = (dy * x_centered * ivar).sum(reduce_N);
   doffset = dy.sum(reduce_N);
@@ -107,21 +105,24 @@ void LayerNormGradEigen(const Eigen::Tensor<T, 2, Eigen::RowMajor> &dy,
   // Compute dl_di: dy * scale * ivar
   auto dl_di = (dy * scale.reshape(one_by_D).broadcast(bcast_N) * ivar).eval();
   U di_dx = 1.;
-  
+
   // Compute dl_dvar: (dy * scale * x_centered * -0.5 * ivar^3).sum(reduce_D)
-  auto dl_dvar = ((dl_di * x_centered *
-                  (-0.5f) * ivar * ivar).sum(reduce_D)).eval();
+  auto dl_dvar =
+      ((dl_di * x_centered * (-0.5f) * ivar * ivar).sum(reduce_D)).eval();
   auto dvar_dx = (2.f * x_centered * D_inv).eval();
 
-  // Compute dl_mean: (-1 * dy * scale * ivar).sum(reduce_D) + (dl_dvar * -2 / D * x_centered).sum(reduce_D)
-  auto dl_dmean =
-      (-1.f * dl_di).sum(reduce_D).eval() + (dl_dvar.reshape(N_by_one).broadcast(bcast_D) * (-2.f) * D_inv *
-       x_centered)
-          .sum(reduce_D).eval();
+  // Compute dl_mean: (-1 * dy * scale * ivar).sum(reduce_D) + (dl_dvar * -2 / D
+  // * x_centered).sum(reduce_D)
+  auto dl_dmean = (-1.f * dl_di).sum(reduce_D).eval() +
+                  (dl_dvar.reshape(N_by_one).broadcast(bcast_D) * (-2.f) *
+                   D_inv * x_centered)
+                      .sum(reduce_D)
+                      .eval();
   U dmean_dx = 1.f * D_inv;
 
-  auto out = dl_di * di_dx + dl_dvar.reshape(N_by_one).broadcast(bcast_D) * dvar_dx +
-       dl_dmean.reshape(N_by_one).broadcast(bcast_D) * dmean_dx;
+  auto out = dl_di * di_dx +
+             dl_dvar.reshape(N_by_one).broadcast(bcast_D) * dvar_dx +
+             dl_dmean.reshape(N_by_one).broadcast(bcast_D) * dmean_dx;
   dx = out.template cast<T>();
 }
 
@@ -141,7 +142,6 @@ int main(int argc, char** argv) {
   InitAlloc(gamma_data, D);
   InitAlloc(beta_data, D);
 
-
   const float epsilon = 0.001f;
   Eigen::Tensor<DTYPE, 2, Eigen::RowMajor> x(N, D);
   Eigen::Tensor<DTYPE, 2, Eigen::RowMajor> y(N, D);
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
   clock_t end = clock();
   time_spent += (double)(end - begin) / (CLOCKS_PER_SEC / 1000);
   printf("Eigen time: %f ms\n", time_spent);
-  
+
   if (allow_print) {
     std::cout << "Eigen y:" << std::endl;
     std::cout << y << std::endl;
@@ -217,9 +217,9 @@ int main(int argc, char** argv) {
     Print2DHost(dbeta_data, 1, D, "CPU dbeta:");
     Print2DHost(dx_data, N, D, "CPU dx:");
   }
-  
-  // We need larger atol and rtol mainly when N is too large. Computing dgamma is
-  // essentially a reduction over N dimension.
+
+  // We need larger atol and rtol mainly when N is too large. Computing dgamma
+  // is essentially a reduction over N dimension.
   IsClose2DHost(dgamma_data, (float*)dscale.data(), 1, D, "dgamma", 1e-2, 1e-2);
   IsClose2DHost(dbeta_data, (float*)doffset.data(), 1, D, "dbeta");
   IsClose2DHost(dx_data, (DTYPE*)dx.data(), N, D, "dx");
