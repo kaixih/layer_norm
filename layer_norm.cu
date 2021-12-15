@@ -11,6 +11,13 @@
     }                                                       \
   }
 
+template <typename T>
+void IsClose2DHost(const T* x, const T* y, int N, int D, std::string msg,
+                   float atol, float rtol);
+
+template <typename T>
+void Print2DHost(const T* x, int N, int D, std::string msg);
+
 template <typename T, typename U>
 void LayerNormCPU(const T* x, const U* gamma, const U* beta, const int N,
                   const int D, const U epsilon, T* y);
@@ -79,23 +86,14 @@ void PrepareAlloc(T** x, int size, int init = -1) {
 }
 
 template <typename T>
-void Print2DHost(const T* x, int N, int D, std::string msg) {
-  printf("%s\n", msg.c_str());
-  for (int i = 0; i < N; i++) {
-    for (int j = 0; j < D; j++) {
-      printf("%f, ", static_cast<float>(x[j + i * D]));
-    }
-    printf("\n");
-  }
-}
-
-template <typename T>
 void Print2D(const T* x, int N, int D, std::string msg) {
   T* buf = new T[N * D];
   checkCUDA(cudaMemcpy(buf, x, N * D * sizeof(T), cudaMemcpyDeviceToHost));
   Print2DHost(buf, N, D, msg);
   delete[] buf;
 }
+
+
 
 template <typename T>
 void IsClose2D(const T* x, const T* y, int N, int D, std::string msg,
@@ -111,21 +109,7 @@ void IsClose2D(const T* x, const T* y, int N, int D, std::string msg,
   }
   T* buf = new T[N * D];
   checkCUDA(cudaMemcpy(buf, x, N * D * sizeof(T), cudaMemcpyDeviceToHost));
-
-  bool is_same = true;
-  for (int i = 0; i < N; i++) {
-    for (int j = 0; j < D; j++) {
-      float d_val = static_cast<float>(buf[j + i * D]);
-      float h_val = static_cast<float>(y[j + i * D]);
-      if (fabs(d_val - h_val) > (atol + rtol * fabs(h_val))) {
-        is_same = false;
-        printf("Found diff: CPU=%f, GPU=%f at (%d, %d)\n", h_val, d_val, i, j);
-        break;
-      }
-    }
-    if (!is_same) break;
-  }
-  printf("Test (%s): %s\n", msg.c_str(), is_same ? "True" : "False");
+  IsClose2DHost(buf, y, N, D, msg, atol, rtol);
   delete[] buf;
 }
 

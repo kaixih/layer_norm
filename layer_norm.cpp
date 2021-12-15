@@ -105,6 +105,36 @@ void LayerNormGradCPU(const T* dy, const T* x, const U* gamma, const int N,
   delete[] cache_ivar;
 }
 
+template <typename T>
+void IsClose2DHost(const T* x, const T* y, int N, int D, std::string msg,
+                   float atol = 1e-3, float rtol = 1e-3) {
+  bool is_same = true;
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < D; j++) {
+      float d_val = static_cast<float>(x[j + i * D]);
+      float h_val = static_cast<float>(y[j + i * D]);
+      if (fabs(d_val - h_val) > (atol + rtol * fabs(h_val))) {
+        is_same = false;
+        printf("Found diff: CPU=%f, GPU=%f at (%d, %d)\n", h_val, d_val, i, j);
+        break;
+      }
+    }
+    if (!is_same) break;
+  }
+  printf("Test (%s): %s\n", msg.c_str(), is_same ? "True" : "False");
+}
+
+template <typename T>
+void Print2DHost(const T* x, int N, int D, std::string msg) {
+  printf("%s\n", msg.c_str());
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < D; j++) {
+      printf("%f, ", static_cast<float>(x[j + i * D]));
+    }
+    printf("\n");
+  }
+}
+
 extern "C" {
 void layer_norm(const float* x, const float* gamma, const float* beta,
                 const int N, const int D, const float epsilon, float* y) {
@@ -115,5 +145,14 @@ void layer_norm_grad(const float* dy, const float* x, const float* gamma,
                      const int N, const int D, const float epsilon, float* dx,
                      float* dgamma, float* dbeta) {
   LayerNormGradCPU(dy, x, gamma, N, D, epsilon, dgamma, dbeta, dx);
+}
+
+void is_close_2d_host(const float* x, const float* y, int N, int D,
+                      std::string msg, float atol = 1e-3, float rtol = 1e-3) {
+  IsClose2DHost(x, y, N, D, msg, atol, rtol);
+}
+
+void print_2d(const float* x, int N, int D, std::string msg) {
+  Print2DHost(x, N, D, msg);
 }
 }
