@@ -85,18 +85,35 @@ def evaluate_np(input_shape):
   check_close(dbeta, dbeta_np, "dbeta")
   check_close(dx, dx_np, "dx")
 
-input_shapes = [
-    (10, 10000000),
-    (100, 1000000),
-    (1000, 100000),
-    (10000, 10000),
-    (100000, 1000),
-    (1000000, 100),
-    (10000000, 10),
-  ]
-for input_shape in input_shapes:
-  evaluate_np(input_shape)
+#input_shapes = [
+#    (10, 10000000),
+#    (100, 1000000),
+#    (1000, 100000),
+#    (10000, 10000),
+#    (100000, 1000),
+#    (1000000, 100),
+#    (10000000, 10),
+#  ]
+#for input_shape in input_shapes:
+#  evaluate_np(input_shape)
 
 
 
+def unit_test():
+  dy = (np.array([2, 9, -4, 5, 8, 7, 2, 9, -4, 5, 8, 7])
+            .reshape(2, 6).astype(np.float))
+  gamma = np.array([4.0, 4.0, 4.0, 4.0, 4.0, 4.0]).astype(np.float)
+  x = (np.array([1, 7, 4, -3, -11, 13, 1, 7, 4, -3, -11, 13])
+           .reshape(2, 6).astype(np.float))
 
+  mean = np.array([1.83, 1.83]).astype(np.float).reshape(2, 1)
+  ivar = np.array([0.13, 0.13]).astype(np.float).reshape(2, 1)
+  cache={}
+  cache['x_mean'] = x - mean
+  cache['ivar'] = ivar
+  dgamma, dbeta, dx = layer_norm_grad_np(dy, gamma, cache)
+  print("Numpy dgamma:\n", dgamma)
+  print("Numpy dbeta:\n", dbeta)
+  print("Numpy dx:\n", dx)
+
+#unit_test()

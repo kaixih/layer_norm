@@ -281,8 +281,8 @@ void LayerNormGPU(const T* x, const U* gamma, const U* beta, const U epsilon,
   bool use_single_block =
       (D <= min_num_blocks * kBlockSize * min_workload_per_thread);
 
-  MeanOp<U, T> mean_ops{D};
-  IvarOp<U, T> ivar_ops{cache_mean, D, epsilon};
+  MeanOp<T, U> mean_ops{D};
+  IvarOp<T, U> ivar_ops{cache_mean, D, epsilon};
 
   cudaEventRecord(start);
 
@@ -409,55 +409,6 @@ __global__ void LayerNormGradBetaGammaTempToOut(const U* __restrict__ tg,
 
   dgamma[tid] = sum_dgamma;
   dbeta[tid] = sum_dbeta;
-}
-
-// Part1: compute the dl_dvars and dl_dmu and store them to a cache.
-template <typename T, typename U>
-__global__ void LayerNormGradInputPart1(const T* __restrict__ dy,
-                                        const T* __restrict__ x,
-                                        const U* __restrict__ gamma,
-                                        const U* __restrict__ cache_mean,
-                                        const U* __restrict__ cache_ivar,
-                                        const int N, const int D, U* dl_dvars,
-                                        U* dl_dmus) {
-  const int tid = threadIdx.x;
-
-  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
-  __shared__ union {
-    typename BlockReduce::TempStorage reduce;
-    U broadcast[1];
-  } temp_storage;
-
-  for (int k = blockIdx.x; k < N; k += gridDim.x) {
-    U dl_dvar = 0;
-    for (int i = tid; i < D; i += kBlockSize) {
-      U curr = GetAs<T, U>(dy, k * D + i);
-      dl_dvar += curr * gamma[i] * (x[k * D + i] - cache_mean[k]) * (-0.5) *
-                 (cache_ivar[k] * cache_ivar[k] * cache_ivar[k]);
-    }
-
-    dl_dvar = BlockReduce(temp_storage.reduce).Sum(dl_dvar);
-
-    if (tid == 0) {
-      temp_storage.broadcast[0] = dl_dvar;
-      dl_dvars[k] = dl_dvar;
-    }
-    __syncthreads();
-    dl_dvar = temp_storage.broadcast[0];
-
-    U dl_dmu = 0;
-    for (int i = tid; i < D; i += kBlockSize) {
-      U curr = GetAs<T, U>(dy, k * D + i);
-      dl_dmu += -1. * curr * gamma[i] * cache_ivar[k] +
-                dl_dvar * (-2. / D) * (x[k * D + i] - cache_mean[k]);
-    }
-
-    dl_dmu = BlockReduce(temp_storage.reduce).Sum(dl_dmu);
-
-    if (tid == 0) {
-      dl_dmus[k] = dl_dmu;
-    }
-  }
 }
 
 template <typename T, typename U, typename Op1, typename Op2>
